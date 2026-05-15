@@ -1,0 +1,26 @@
+services:
+
+  spark:
+    build: .
+    container_name: faers_spark
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./notebooks:/app/notebooks
+    environment:
+      - SPARK_DRIVER_MEMORY=4g
+    ports:
+      - "4040:4040"
+      - "8888:8888"
+    command: uv run jupyter notebook --ip=0.0.0.0 --no-browser --allow-root --notebook-dir=/app/notebooks
+
+  dashboard:
+    build: .
+    container_name: faers_dashboard
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./dashboard:/app/dashboard
+    ports:
+      - "8501:8501"
+    command: uv run streamlit run dashboard/app.py
