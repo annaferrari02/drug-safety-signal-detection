@@ -6,9 +6,6 @@ dist/
 wheels/
 *.egg-info
 
-data/raw/
-
-data/parquet/
 
 data/*.duckdb
 
@@ -18,3 +15,10 @@ __pycache__/
 
 # Virtual environments
 .venv
+
+# Docker
+.docker/
+
+# Dati grezzi (troppo pesanti per git)
+data/raw/
+data/parquet/

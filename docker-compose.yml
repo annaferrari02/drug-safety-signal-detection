@@ -1,7 +1,10 @@
 services:
 
   spark:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
     container_name: faers_spark
     volumes:
       - ./data:/app/data
@@ -15,7 +18,10 @@ services:
     command: uv run jupyter notebook --ip=0.0.0.0 --no-browser --allow-root --notebook-dir=/app/notebooks
 
   dashboard:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
     container_name: faers_dashboard
     volumes:
       - ./data:/app/data
