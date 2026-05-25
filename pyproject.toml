@@ -3,7 +3,7 @@ name = "drug-safety-signal-detection"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5.2",
     "ijson>=3.5.0",
@@ -13,8 +13,11 @@ dependencies = [
     "plotly>=6.7.0",
     "pyarrow>=24.0.0",
     "pyspark==3.5.5",
+    "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
+    "statsmodels>=0.14.6",
     "streamlit>=1.57.0",
+    "sympy>=1.14.0",
 ]
 
 [dependency-groups]
