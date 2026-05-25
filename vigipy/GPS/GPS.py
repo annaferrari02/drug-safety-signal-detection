@@ -4,7 +4,9 @@ import warnings
 from scipy.special import gdtr
 from scipy.stats import nbinom
 from scipy.optimize import minimize
-from sympy.functions.special import gamma_functions
+#NUOVO
+from scipy.special import digamma as scipy_digamma 
+
 
 from ..utils import Container
 from ..utils import calculate_expected
@@ -13,8 +15,8 @@ from ..utils.distribution_funcs.quantile_funcs import quantiles
 
 dnbinom = np.vectorize(dnbinom)
 pnbinom = np.vectorize(pnbinom)
-digamma = np.vectorize(gamma_functions.digamma)
-quantiles = np.vectorize(quantiles)
+digamma = scipy_digamma
+#quantiles = np.vectorize(quantiles)
 
 EPS = np.finfo(np.float32).eps
 BOUNDED_METHODS = {
@@ -226,7 +228,7 @@ def gps(
     elif ranking_statistic == "quantile":
         RankStat = LB
     elif ranking_statistic == "log2":
-        RankStat = np.array([x.evalf() for x in EBlog2])
+        RankStat = EBlog2.astype(float)
 
     post_cumsum = np.cumsum(posterior_probability)
     post_1_cumsum = np.cumsum(1 - posterior_probability)
@@ -265,7 +267,8 @@ def gps(
     RES.param["input_params"] = input_params
     RES.param["prior_init"] = prior_init
     RES.param["prior_param"] = priors
-    RES.param["convergence"] = code_convergence
+    RES.param["convergence"] = code_convergence if not p_out else "prior_param provided manually"
+    
 
     # SIGNALS RESULTS and presentation
     if ranking_statistic == "p_value":
