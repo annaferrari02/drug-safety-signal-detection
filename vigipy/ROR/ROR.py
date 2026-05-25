@@ -58,9 +58,9 @@ def ror(
     num_cell = len(n11)
     expected = calculate_expected(N, n1j, ni1, n11, expected_method, method_alpha)
 
-    n10 = n1j - n11
+    n10 = n1j - n11 + 1e-7
     n01 = ni1 - n11 + 1e-7
-    n00 = N - (n11 + n10 + n01)
+    n00 = N - (n11 + n10 + n01) + 1e-7 
 
     log_ror = np.log(n11 * n00 / (n10 * n01))
     var_log_ror = 1.0 / n11 + 1.0 / n10 + 1.0 / n01 + 1.0 / n00
