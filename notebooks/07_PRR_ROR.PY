@@ -14,7 +14,7 @@ from vigipy.PRR import prr
 from vigipy.ROR import ror
 from vigipy.utils import Container
 
-
+"""
 # ── 1. CONFIG ─────────────────────────────────────────────────────────────────
 
 PARQUET_PATH = "data/faers_flat_deduped.parquet"   # or faers_flat.parquet
@@ -95,14 +95,11 @@ data = data[data["product_aes"] >= 50]
 print(f"Total unique reports (N): {N:,}")
 print(f"Unique drug-reaction pairs: {len(data):,}")
 print(data.head())
-
+"""
 
 # ── 5. BUILD THE CONTAINER OBJECT ────────────────────────────────────────────
 
-container = Container()
-container.data = data   # DataFrame with: events, product_name, ae_name,
-                        #                 product_aes, count_across_brands
-container.N    = N
+%run ./04_contingency_duck.ipynb
 
 
 # ── 6. RUN PRR ────────────────────────────────────────────────────────────────
