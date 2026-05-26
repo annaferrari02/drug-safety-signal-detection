@@ -99,7 +99,41 @@ print(data.head())
 
 # ── 5. BUILD THE CONTAINER OBJECT ────────────────────────────────────────────
 
-%run ./04_contingency_duck.ipynb
+ct = pd.read_parquet("notebooks/data/contingency_table.parquet")
+def contingency_to_vigipy(ct: pd.DataFrame) -> tuple[Container, int]:
+    """
+    Converte la contingency table 2x2 nel formato atteso da vigipy GPS.
+    """
+    df = ct.copy()
+    df = df.rename(columns={
+        "drug": "product_name",
+        "pt":   "ae_name",
+        "a":    "events",
+    })
+    df["product_aes"]          = df["events"] + df["b"]   # a + b
+    df["count_across_brands"]  = df["events"] + df["c"]   # a + c
+
+    N = int(df["n"].iloc[0])  # totale unico per tutto il sottoinsieme
+
+    container = Container(params=False)
+    container.data = df[["product_name", "ae_name", "events",
+                          "product_aes", "count_across_brands"]]
+    container.N    = N
+
+    # Matrice di contingenza pivot (drug x PT) — serve per stimare i prior
+    container.contingency = df.pivot_table(
+        index="product_name",
+        columns="ae_name",
+        values="events",
+        fill_value=0
+    )
+
+    return container, N
+
+container, N = contingency_to_vigipy(ct)
+print(f"N totale report: {N}")
+print(f"Coppie drug-PT : {len(container.data)}")
+container.data.head()
 
 
 # ── 6. RUN PRR ────────────────────────────────────────────────────────────────
