@@ -60,9 +60,9 @@ def prr(
     num_cell = len(n11)
     expected = calculate_expected(N, n1j, ni1, n11, expected_method, method_alpha)
 
-    n10 = n1j - n11
+    n10 = n1j - n11 + 1e-7
     n01 = ni1 - n11 + 1e-7
-    n00 = N - (n11 + n10 + n01)
+    n00 = N - (n11 + n10 + n01) + 1e-7
 
     log_prr = np.log((n11 / (n11 + n10)) / (n01 / (n01 + n00)))
     var_log_prr = 1 / n11 - 1 / (n11 + n10) + 1 / n01 - 1 / (n01 + n00)
