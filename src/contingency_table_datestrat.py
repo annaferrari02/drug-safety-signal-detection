@@ -34,7 +34,7 @@ def build_contingency_table_datestrat(
         Range di date (inclusivo) nel formato ('YYYY-MM-DD', 'YYYY-MM-DD').
         Esempio: ('2015-01-01', '2020-12-31')
     date_col : str
-        Colonna della data nel Parquet, default "receivedate".
+        Colonna della data nel Parquet, default "report_date".
 
     Returns
     -------
@@ -145,19 +145,3 @@ def build_contingency_table_datestrat(
     """
 
     return duckdb.connect().execute(query).df()
-
-
-# def qc_contingency_table(df: pd.DataFrame, label: str = "") -> None:
-#     tag = f"[{label}] " if label else ""
-#     check = df["a"] + df["b"] + df["c"] + df["d"]
-#     bad   = (check != df["n"]).sum()
-
-#     print(f"\n{tag}QC Report — {len(df)} coppie (drug, PT)")
-#     print(f"  a+b+c+d == n : {'OK' if bad == 0 else f'FAIL ({bad} righe)'}")
-#     print(f"  Celle negative: a={( df['a']<0).sum()} b={(df['b']<0).sum()} "
-#           f"c={(df['c']<0).sum()} d={(df['d']<0).sum()}")
-#     print(f"  a  — min={df['a'].min()}  median={df['a'].median():.0f}  "
-#           f"max={df['a'].max()}  sum={df['a'].sum()}")
-#     print(f"  n  — valore unico: {df['n'].nunique()==1}  "
-#           f"({df['n'].iloc[0] if len(df) else 'n/a'})")
-#     print(f"  Top 5 PT per a:\n{df[['pt','a']].head(5).to_string(index=False)}")
