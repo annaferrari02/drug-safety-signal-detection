@@ -1,17 +1,18 @@
 import duckdb
 import pandas as pd
 from pathlib import Path
+from typing import Tuple, Optional
 
 PARQUET_PATH = "data/faers_flat.parquet"
 
-# FUNZIONE CORE
-
-def build_contingency_table(
+def build_contingency_table_datestrat(
         parquet_path : str,
         target_drug  : str,
-        pt_col       : str  = "reaction_pt",
-        min_a        : int  = 3,
-        where_extra  : str  = None,
+        pt_col       : str                            = "reaction_pt",
+        min_a        : int                            = 3,
+        where_extra  : str                            = None,
+        date_range   : Optional[Tuple[str, str]]      = None,   # <-- NUOVO
+        date_col     : str                            = "receivedate",  # <-- NUOVO
 ) -> pd.DataFrame:
     """
     Costruisce la contingency table 2x2 per tutte le coppie (drug, PT)
@@ -29,31 +30,44 @@ def build_contingency_table(
         Soglia minima per la cella a (default 3, criterio letteratura).
     where_extra : str | None
         Clausola WHERE aggiuntiva per la stratificazione, senza il WHERE.
-        Esempi:
-            "sex = 'female'"
-            "age_stratum = 'geriatric'"
-            "sex = 'female' AND age_stratum = 'adult'"
-            "safetyreportid IN (
-                SELECT DISTINCT safetyreportid
-                FROM 'data/faers_flat.parquet'
-                WHERE drug_name = 'CAPECITABINE'
-             )"
+    date_range : tuple(str, str) | None
+        Range di date (inclusivo) nel formato ('YYYY-MM-DD', 'YYYY-MM-DD').
+        Esempio: ('2015-01-01', '2020-12-31')
+    date_col : str
+        Colonna della data nel Parquet, default "receivedate".
 
     Returns
     -------
     pd.DataFrame con colonne [drug, pt, a, b, c, d, n]
     """
 
-    # Componi il filtro WHERE
-    base_filter = f"drug_name = '{target_drug}'"
-    if where_extra:
-        full_filter = f"{base_filter} AND {where_extra}"
-        bg_filter   = where_extra          # background: stessa stratificazione, tutti i drug
-    else:
-        full_filter = base_filter
-        bg_filter   = None                 # background: tutto il dataset
+    # ── Costruisci il filtro data ────────────────────────────────────────────────
+    def build_date_filter(date_range, date_col):
+        if date_range is None:
+            return None
+        start, end = date_range
+        return f"{date_col} BETWEEN '{start}' AND '{end}'"
 
-    bg_where = f"WHERE {bg_filter}" if bg_filter else ""
+    date_filter = build_date_filter(date_range, date_col)
+
+    # ── Combina tutti i filtri ───────────────────────────────────────────────────
+    filters = [f"drug_name = '{target_drug}'"]
+    if date_filter:
+        filters.append(date_filter)
+    if where_extra:
+        filters.append(where_extra)
+
+    full_filter = " AND ".join(filters)
+
+    # background: stessa stratificazione demografica + date, senza drug filter
+    bg_filters = []
+    if date_filter:
+        bg_filters.append(date_filter)
+    if where_extra:
+        bg_filters.append(where_extra)
+
+    bg_filter = " AND ".join(bg_filters) if bg_filters else None
+    bg_where  = f"WHERE {bg_filter}" if bg_filter else ""
 
     query = f"""
     WITH
@@ -65,8 +79,7 @@ def build_contingency_table(
         WHERE {full_filter}
     ),
 
-    -- ── Background: TUTTI i report nel sottoinsieme demografico ─────────────────
-    -- (se non c'è stratificazione demografica = tutti i report del dataset)
+    -- ── Background: TUTTI i report nel sottoinsieme (demografico + date) ─────────
     background_reports AS (
         SELECT DISTINCT safetyreportid AS report_id
         FROM '{parquet_path}'
@@ -134,28 +147,17 @@ def build_contingency_table(
     return duckdb.connect().execute(query).df()
 
 
-# QC: verifica sanità delle 4 celle
+# def qc_contingency_table(df: pd.DataFrame, label: str = "") -> None:
+#     tag = f"[{label}] " if label else ""
+#     check = df["a"] + df["b"] + df["c"] + df["d"]
+#     bad   = (check != df["n"]).sum()
 
- 
-def qc_contingency_table(df: pd.DataFrame, label: str = "") -> None:
-    """
-    Stampa un report di sanità sulla contingency table:
-        - a + b + c + d == n per ogni riga
-        - nessuna cella negativa
-        - distribuzione di a
-    """
-    tag = f"[{label}] " if label else ""
- 
-    # Verifica a + b + c + d = n
-    check = df["a"] + df["b"] + df["c"] + df["d"]
-    bad   = (check != df["n"]).sum()
- 
-    print(f"\n{tag}QC Report — {len(df)} coppie (drug, PT)")
-    print(f"  a+b+c+d == n : {'OK' if bad == 0 else f'FAIL ({bad} righe)'}")
-    print(f"  Celle negative: a={( df['a']<0).sum()} b={(df['b']<0).sum()} "
-          f"c={(df['c']<0).sum()} d={(df['d']<0).sum()}")
-    print(f"  a  — min={df['a'].min()}  median={df['a'].median():.0f}  "
-          f"max={df['a'].max()}  sum={df['a'].sum()}")
-    print(f"  n  — valore unico: {df['n'].nunique()==1}  "
-          f"({df['n'].iloc[0] if len(df) else 'n/a'})")
-    print(f"  Top 5 PT per a:\n{df[['pt','a']].head(5).to_string(index=False)}")
+#     print(f"\n{tag}QC Report — {len(df)} coppie (drug, PT)")
+#     print(f"  a+b+c+d == n : {'OK' if bad == 0 else f'FAIL ({bad} righe)'}")
+#     print(f"  Celle negative: a={( df['a']<0).sum()} b={(df['b']<0).sum()} "
+#           f"c={(df['c']<0).sum()} d={(df['d']<0).sum()}")
+#     print(f"  a  — min={df['a'].min()}  median={df['a'].median():.0f}  "
+#           f"max={df['a'].max()}  sum={df['a'].sum()}")
+#     print(f"  n  — valore unico: {df['n'].nunique()==1}  "
+#           f"({df['n'].iloc[0] if len(df) else 'n/a'})")
+#     print(f"  Top 5 PT per a:\n{df[['pt','a']].head(5).to_string(index=False)}")
