@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+
+data/*.duckdb
+
+__pycache__/
+
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv
+
+# Docker
+.docker/
+
+# Dati grezzi (troppo pesanti per git)
+data/raw/
+data/parquet/
+notebooks/data/raw
+data/deduplication_report.txt
+data/faers_flat_deduped.parquet
+data/faers_flat.parquet
+notebooks/data/
+*.csv

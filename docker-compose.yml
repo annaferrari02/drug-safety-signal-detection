@@ -1,0 +1,37 @@
+services:
+
+  ingestion:
+    build:
+      context: .                          # root del progetto come contesto di build
+      dockerfile: ingestion/Dockerfile
+    volumes:
+      # data/ condivisa tra host e container: i Parquet scritti dal container
+      # appaiono direttamente nella cartella data/ locale
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    profiles:
+      - pipeline                          # si avvia solo con --profile pipeline
+
+  signals:
+    build:
+      context: .
+      dockerfile: signals/Dockerfile
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - ingestion
+    environment:
+      - PYTHONUNBUFFERED=1                         # aspetta che ingestion parta prima
+    profiles:
+      - pipeline
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    volumes:
+      - ./data:/app/data                  # legge i Parquet prodotti dalla pipeline
+    ports:
+      - "8501:8501"                       # http://localhost:8501 nel browser
+    # il dashboard non ha profile: gira sempre con "docker compose up dashboard"
