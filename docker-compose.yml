@@ -1,32 +1,37 @@
 services:
 
-  spark:
+  ingestion:
+    build:
+      context: .                          # root del progetto come contesto di build
+      dockerfile: ingestion/Dockerfile
+    volumes:
+      # data/ condivisa tra host e container: i Parquet scritti dal container
+      # appaiono direttamente nella cartella data/ locale
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    profiles:
+      - pipeline                          # si avvia solo con --profile pipeline
+
+  signals:
     build:
       context: .
-      dockerfile: Dockerfile
-    platform: linux/amd64
-    container_name: faers_spark
+      dockerfile: signals/Dockerfile
     volumes:
       - ./data:/app/data
-      - ./src:/app/src
-      - ./notebooks:/app/notebooks
+    depends_on:
+      - ingestion
     environment:
-      - SPARK_DRIVER_MEMORY=4g
-    ports:
-      - "4040:4040"
-      - "8888:8888"
-    command: uv run jupyter notebook --ip=0.0.0.0 --no-browser --allow-root --notebook-dir=/app/notebooks
+      - PYTHONUNBUFFERED=1                         # aspetta che ingestion parta prima
+    profiles:
+      - pipeline
 
   dashboard:
     build:
       context: .
-      dockerfile: Dockerfile
-    platform: linux/amd64
-    container_name: faers_dashboard
+      dockerfile: dashboard/Dockerfile
     volumes:
-      - ./data:/app/data
-      - ./src:/app/src
-      - ./dashboard:/app/dashboard
+      - ./data:/app/data                  # legge i Parquet prodotti dalla pipeline
     ports:
-      - "8501:8501"
-    command: uv run streamlit run dashboard/app.py
+      - "8501:8501"                       # http://localhost:8501 nel browser
+    # il dashboard non ha profile: gira sempre con "docker compose up dashboard"
