@@ -1,5 +1,8 @@
 import os
 import json
+
+import time
+
 from openai import OpenAI
 
 from dotenv import load_dotenv
@@ -82,16 +85,23 @@ The database has the following columns:
 """
 
 
-def parse_nl_to_params(user_input: str) -> dict:
-    response = client.chat.completions.create(
-        model="mistral-small-latest",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_input}
-        ]
-    )
-    raw = response.choices[0].message.content.strip()
-    return json.loads(raw)
+def parse_nl_to_params(user_input: str, retries=3) -> dict:
+    for attempt in range(retries):
+        try:
+            response = client.chat.completions.create(
+                model="mistral-small-latest",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_input}
+                ]
+            )
+            raw = response.choices[0].message.content.strip()
+            return json.loads(raw)
+        except Exception as e:
+            if "429" in str(e) and attempt < retries - 1:
+                time.sleep(2 ** attempt)  # backoff: 1s, 2s, 4s
+                continue
+            raise
 
 
 def nl_to_contingency_table(user_input: str):
@@ -104,3 +114,5 @@ def nl_to_contingency_table(user_input: str):
         min_a=params.get("min_a", 3),
         where_extra=params.get("where_extra")
     )
+
+   
