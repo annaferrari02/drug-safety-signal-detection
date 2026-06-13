@@ -1,7 +1,7 @@
 ================================================================================
 FAERS DEDUPLICATION REPORT
 ================================================================================
-Data esecuzione  : 2026-06-09 13:39:47
+Data esecuzione  : 2026-06-10 16:26:23
 Python / DuckDB  : 3.13.13 / 1.5.2
 File input       : data/faers_flat.parquet
 File output      : data/faers_flat_deduped.parquet

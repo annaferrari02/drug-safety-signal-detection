@@ -45,8 +45,8 @@ from src.contingency_table import build_contingency_table, qc_contingency_table
 from src.signals import compute_prr, compute_ror, compute_bcpnn, compute_mgps
 from src.validate_label import validate_signals, validation_summary
 
-PARQUET_PATH = Path("data/faers_flat_deduped.parquet")
-CONFIG_FILE  = Path("run_config.json")
+PARQUET_PATH = Path(__file__).resolve().parent.parent / "data" / "faers_flat_deduped.parquet"
+CONFIG_FILE  = Path(__file__).resolve().parent.parent / "run_config.json"
 
 
 # CONFIGURAZIONE
