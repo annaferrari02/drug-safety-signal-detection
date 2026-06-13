@@ -96,6 +96,7 @@ def parse_nl_to_params(user_input: str, retries=3) -> dict:
                 ]
             )
             raw = response.choices[0].message.content.strip()
+            raw = raw.strip("```json").strip("```").strip()
             return json.loads(raw)
         except Exception as e:
             if "429" in str(e) and attempt < retries - 1:
