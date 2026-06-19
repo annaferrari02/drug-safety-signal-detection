@@ -16,6 +16,8 @@ COPY src/ ./src/
 # Copia i due script di ingestion
 COPY ingestion/run_download.py .
 COPY ingestion/run_flatten.py .
+COPY ingestion/update_ingestion.py .
+COPY ingestion/update_scheduler.py .
 
 RUN mkdir -p data/raw
 

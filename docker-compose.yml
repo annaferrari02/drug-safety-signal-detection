@@ -37,3 +37,17 @@ services:
     ports:
       - "8501:8501"                       # http://localhost:8501 nel browser
     # il dashboard non ha profile: gira sempre con "docker compose up dashboard"
+
+  scheduler:                              
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile   # stessa immagine di ingestion
+    volumes:
+      - ./data:/app/data                 # stessa data/ condivisa
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python update_scheduler.py  # sovrascrive il CMD del Dockerfile
+    restart: unless-stopped
+    profiles:
+      - update                           # attivato solo esplicitamente
+

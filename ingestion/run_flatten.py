@@ -268,19 +268,21 @@ def _write_batch(
         rows:   list[dict],
         writer: pq.ParquetWriter | None,
         schema: pa.Schema | None,
+        output_path: Path | None=None,
 ) -> tuple[pq.ParquetWriter, pa.Schema]:
     """
     Converte una lista di righe in una PyArrow Table e la appende al Parquet.
     Apre il ParquetWriter al primo batch e lo riusa per tutti i successivi,
     garantendo schema consistente in tutto il file.
     """
+    target = output_path if output_path is not None else PARQUET_FLAT
     df    = pd.DataFrame(rows)
     table = pa.Table.from_pandas(df, preserve_index=False)
 
     if writer is None:
         # Primo batch: apre il file e fissa lo schema
         schema = table.schema
-        writer = pq.ParquetWriter(str(PARQUET_FLAT), schema)
+        writer = pq.ParquetWriter(str(target), schema)
 
     # Cast al schema del primo batch per evitare type mismatch tra quarter
     writer.write_table(table.cast(schema))
