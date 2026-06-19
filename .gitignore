@@ -1,4 +1,4 @@
-# Python-generated files
+﻿# Python-generated files
 __pycache__/
 *.py[oc]
 build/
@@ -28,3 +28,8 @@ data/faers_flat_deduped.parquet
 data/faers_flat.parquet
 notebooks/data/
 *.csv
+
+# Segreti
+.env
+*.env
+config/secrets.py

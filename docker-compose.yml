@@ -27,6 +27,8 @@ services:
       - pipeline
 
   dashboard:
+    env_file:
+      - .env
     build:
       context: .
       dockerfile: dashboard/Dockerfile
