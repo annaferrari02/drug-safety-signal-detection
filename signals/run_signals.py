@@ -8,7 +8,8 @@ Restituisce i risultati in memoria come dizionario di DataFrame,
 senza scrivere file temporanei su disco.
 
 Le uniche scritture su disco sono:
-    data/label_cache.json  — cache delle chiamate API openFDA label (costose)
+    data/label_cache.json    — cache delle chiamate API openFDA label (costose)
+    data/approval_cache.json — cache degli anni di approvazione FDA (weber_check)
 
 Utilizzo attuale (senza dashboard):
     results = run_pipeline(get_run_config())
@@ -26,7 +27,8 @@ Struttura del dict restituito da run_pipeline():
         "ror":                pd.DataFrame | None
         "bcpnn":              pd.DataFrame | None
         "mgps":               pd.DataFrame | None
-        "validated":          pd.DataFrame    — segnali positivi con validazione label
+        "validated":          pd.DataFrame    — segnali con validazione label FDA
+        "weber_check":        dict            — risultato check Weber effect
         "run_summary":        dict            — metadata (tempi, conteggi)
     }
 """
@@ -44,12 +46,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.contingency_table import build_contingency_table, qc_contingency_table
 from src.signals import compute_prr, compute_ror, compute_bcpnn, compute_mgps
 from src.validate_label import validate_signals, validation_summary
+from src.weber_check import check_weber_effect, weber_summary          # <-- NUOVO
 
 PARQUET_PATH = Path(__file__).resolve().parent.parent / "data" / "faers_flat_deduped.parquet"
 CONFIG_FILE  = Path(__file__).resolve().parent.parent / "run_config.json"
 
 
-# CONFIGURAZIONE
+# ── CONFIGURAZIONE ───────────────────────────────────────────────────────────
 # get_run_config() è l'unico punto che cambierà con l'integrazione della dashboard.
 
 def get_run_config() -> dict:
@@ -62,30 +65,34 @@ def get_run_config() -> dict:
 
     Struttura del dict restituito:
     {
-        "target_drug":     str        — nome farmaco in uppercase, es. "LAPATINIB"
-        "where_extra":     str | None — filtro SQL per stratificazione
-        "min_a":           int        — soglia minima cella a della CT (default 3)
-        "algorithms":      list       — sottoinsieme di ["prr", "ror", "bcpnn", "mgps"]
-        "fdr_threshold":   float      — soglia FDR per PRR e ROR (default 0.05)
-        "eb05_threshold":  float      — soglia EB05 per MGPS (default 2.0)
-        "ic_threshold":    float      — soglia IC025 per BCPNN (default 0.0)
-        "openfda_api_key": str | None — chiave API openFDA opzionale
-        "validate_label":  bool       — se True esegue validazione contro label FDA
+        "target_drug":            str        — nome farmaco in uppercase, es. "LAPATINIB"
+        "where_extra":            str | None — filtro SQL per stratificazione
+        "min_a":                  int        — soglia minima cella a della CT (default 3)
+        "algorithms":             list       — sottoinsieme di ["prr", "ror", "bcpnn", "mgps"]
+        "fdr_threshold":          float      — soglia FDR per PRR e ROR (default 0.05)
+        "eb05_threshold":         float      — soglia EB05 per MGPS (default 2.0)
+        "ic_threshold":           float      — soglia IC025 per BCPNN (default 0.0)
+        "openfda_api_key":        str | None — chiave API openFDA opzionale
+        "validate_label":         bool       — se True esegue validazione label FDA
+        "check_weber":            bool       — se True esegue Weber effect check
+        "weber_approval_override":int | None — anno di approvazione manuale (bypassa API)
     }
 
     TODO (dashboard): sostituire con build_config_from_ui(user_input) che riceve
     i parametri dal form Streamlit e restituisce lo stesso dict.
     """
     defaults = {
-        "target_drug":     "LAPATINIB",
-        "where_extra":     None,
-        "min_a":           3,
-        "algorithms":      ["prr", "ror", "bcpnn", "mgps"],
-        "fdr_threshold":   0.05,
-        "eb05_threshold":  2.0,
-        "ic_threshold":    0.0,
-        "openfda_api_key": None,
-        "validate_label":  True,
+        "target_drug":             "LAPATINIB",
+        "where_extra":             None,
+        "min_a":                   3,
+        "algorithms":              ["prr", "ror", "bcpnn", "mgps"],
+        "fdr_threshold":           0.05,
+        "eb05_threshold":          2.0,
+        "ic_threshold":            0.0,
+        "openfda_api_key":         None,
+        "validate_label":          True,
+        "check_weber":             True,       # <-- NUOVO
+        "weber_approval_override": None,       # <-- NUOVO
     }
 
     if CONFIG_FILE.exists():
@@ -99,7 +106,7 @@ def get_run_config() -> dict:
     return defaults
 
 
-# LOGICA DI ESECUZIONE
+# ── LOGICA DI ESECUZIONE ─────────────────────────────────────────────────────
 # Queste funzioni non cambieranno con l'integrazione della dashboard.
 
 def run_algorithm(name: str, ct: pd.DataFrame, config: dict) -> pd.DataFrame | None:
@@ -165,6 +172,7 @@ def build_run_summary(
         config:        dict,
         algo_results:  dict[str, pd.DataFrame],
         validated:     pd.DataFrame,
+        weber:         dict,
         total_elapsed: float,
 ) -> dict:
     """
@@ -202,6 +210,7 @@ def build_run_summary(
         },
         "algorithm_results": algo_stats,
         "validation":        val_stats,
+        "weber_risk":        weber.get("weber_risk"),           # <-- NUOVO
         "total_elapsed_s":   round(total_elapsed, 1),
     }
 
@@ -220,7 +229,8 @@ def run_pipeline(config: dict) -> dict:
     Returns
     -------
     dict con chiavi:
-        config, contingency_table, prr, ror, bcpnn, mgps, validated, run_summary
+        config, contingency_table, prr, ror, bcpnn, mgps,
+        validated, weber_check, run_summary
     """
     t_start = time.time()
 
@@ -263,11 +273,27 @@ def run_pipeline(config: dict) -> dict:
     else:
         print("  [SKIP] Validazione disabilitata o nessun segnale positivo")
 
-    # STEP 4: Run summary
+    # STEP 4: Weber effect check                                    # <-- NUOVO
+    print("\n=== Weber effect check ===")
+    weber = {}
+    if config.get("check_weber", True):
+        weber = check_weber_effect(
+            parquet_path=str(PARQUET_PATH),
+            target_drug=config["target_drug"],
+            api_key=config.get("openfda_api_key"),
+            approval_year_override=config.get("weber_approval_override"),
+        )
+        weber_summary(weber)
+    else:
+        print("  [SKIP] Weber check disabilitato")
+
+    # STEP 5: Run summary
+    print("\n=== Run summary ===")
     run_summary = build_run_summary(
         config=config,
         algo_results=algo_results,
         validated=validated,
+        weber=weber,
         total_elapsed=time.time() - t_start,
     )
 
@@ -278,6 +304,7 @@ def run_pipeline(config: dict) -> dict:
         "contingency_table": ct,
         **algo_results,         # prr, ror, bcpnn, mgps — ognuno None se fallito
         "validated":         validated,
+        "weber_check":       weber,            # <-- NUOVO
         "run_summary":       run_summary,
     }
 
@@ -286,8 +313,6 @@ if __name__ == "__main__":
     config  = get_run_config()
     results = run_pipeline(config)
 
-    # Stampa un riepilogo a video — in futuro il dashboard mostrerà
-    # gli stessi dati nella UI senza questo blocco di print
     summary = results["run_summary"]
     print("\n=== RIEPILOGO ===")
     for algo, stats in summary.get("algorithm_results", {}).items():
@@ -299,3 +324,5 @@ if __name__ == "__main__":
         print(f"    KNOWN          : {v.get('KNOWN', 0)}")
         print(f"    POTENTIALLY NEW: {v.get('POTENTIALLY_NEW', 0)}")
         print(f"    NO LABEL       : {v.get('NO_LABEL', 0)}")
+    if summary.get("weber_risk"):
+        print(f"\n  Weber effect risk: {summary['weber_risk']}")
