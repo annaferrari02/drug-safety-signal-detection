@@ -609,7 +609,7 @@ def weber_summary(result: dict) -> None:
     if result["early_phase_ratio"] is not None:
         print(f"  Early-phase ratio: {result['early_phase_ratio']:.1%} "
               f"(primi 2 anni post-approvazione)")
-    print(f"\n  {icon} Weber risk: {result['weber_risk']}")
+    print(f"\n  Weber risk: {result['weber_risk']}")
     for reason in result["risk_reasons"]:
         print(f"    • {reason}")
     print(f"\n  {result['warning_message']}")

@@ -48,7 +48,7 @@ from src.signals import compute_prr, compute_ror, compute_bcpnn, compute_mgps
 from src.validate_label import validate_signals, validation_summary
 from src.weber_check import check_weber_effect, weber_summary          # <-- NUOVO
 
-PARQUET_PATH = Path(__file__).resolve().parent.parent / "data" / "faers_flat_deduped.parquet"
+PARQUET_PATH = Path(__file__).resolve().parent / "data" / "faers_flat_deduped.parquet"
 CONFIG_FILE  = Path(__file__).resolve().parent.parent / "run_config.json"
 
 
@@ -91,7 +91,7 @@ def get_run_config() -> dict:
         "ic_threshold":            0.0,
         "openfda_api_key":         None,
         "validate_label":          True,
-        "check_weber":             True,       # <-- NUOVO
+        "check_weber":             True,       
         "weber_approval_override": None,       # <-- NUOVO
     }
 
@@ -210,7 +210,7 @@ def build_run_summary(
         },
         "algorithm_results": algo_stats,
         "validation":        val_stats,
-        "weber_risk":        weber.get("weber_risk"),           # <-- NUOVO
+        "weber_risk":        weber.get("weber_risk"),           
         "total_elapsed_s":   round(total_elapsed, 1),
     }
 
@@ -273,7 +273,7 @@ def run_pipeline(config: dict) -> dict:
     else:
         print("  [SKIP] Validazione disabilitata o nessun segnale positivo")
 
-    # STEP 4: Weber effect check                                    # <-- NUOVO
+    # STEP 4: Weber effect check                                    
     print("\n=== Weber effect check ===")
     weber = {}
     if config.get("check_weber", True):
@@ -304,7 +304,7 @@ def run_pipeline(config: dict) -> dict:
         "contingency_table": ct,
         **algo_results,         # prr, ror, bcpnn, mgps — ognuno None se fallito
         "validated":         validated,
-        "weber_check":       weber,            # <-- NUOVO
+        "weber_check":       weber,            
         "run_summary":       run_summary,
     }
 
