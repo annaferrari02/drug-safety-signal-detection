@@ -49,7 +49,7 @@ from src.validate_label import validate_signals, validation_summary
 from src.weber_check import check_weber_effect, weber_summary          # <-- NUOVO
 
 PARQUET_PATH = Path(__file__).resolve().parent / "data" / "faers_flat_deduped.parquet"
-CONFIG_FILE  = Path(__file__).resolve().parent.parent / "run_config.json"
+CONFIG_FILE  = Path(__file__).resolve().parent / "run_config.json"
 
 
 # ── CONFIGURAZIONE ───────────────────────────────────────────────────────────
@@ -298,6 +298,11 @@ def run_pipeline(config: dict) -> dict:
     )
 
     print(f"\n=== Completato in {run_summary['total_elapsed_s']}s ===")
+    # Persisti i segnali su disco per il pannello panoramico del dashboard
+    SIGNALS_OUT = Path(__file__).resolve().parent / "data" / "signals_full.parquet"
+    if len(validated) > 0:
+        validated.to_parquet(SIGNALS_OUT, index=False)
+        print(f"  [OK] signals_full.parquet scritto ({len(validated)} righe)")
 
     return {
         "config":            config,
@@ -326,3 +331,4 @@ if __name__ == "__main__":
         print(f"    NO LABEL       : {v.get('NO_LABEL', 0)}")
     if summary.get("weber_risk"):
         print(f"\n  Weber effect risk: {summary['weber_risk']}")
+
