@@ -43,8 +43,8 @@ SUGGESTED_DRUGS = [
     "METFORMIN",
 ]
 
-SEX_OPTIONS = ["Tutti", "Female", "Male"]
-AGE_OPTIONS = ["Tutti", "Pediatric", "Adult", "Geriatric"]
+SEX_OPTIONS = ["All", "Female", "Male"]
+AGE_OPTIONS = ["All", "Pediatric", "Adult", "Geriatric"]
 
 
 # ---------------------------------------------------------------------------
@@ -136,33 +136,33 @@ def build_config_from_ui(
 # ---------------------------------------------------------------------------
 def run_and_display(config: dict, age_stratum_for_unknown_check: str | None = None):
     if not config["target_drug"]:
-        st.warning("Inserisci almeno il nome del drug prima di eseguire.")
+        st.warning("Write at least the drug name.")
         return
 
-    st.subheader("Parametri estratti")
+    st.subheader("Parameters")
     pcol1, pcol2, pcol3 = st.columns(3)
     pcol1.metric("Drug", config["target_drug"])
-    pcol2.metric("Min occorrenze (a)", config["min_a"])
-    pcol3.metric("Filtro", config["where_extra"] or "Nessuno")
+    pcol2.metric("Min occurrences (a)", config["min_a"])
+    pcol3.metric("Filter", config["where_extra"] or "Nessuno")
 
     unknown_excluded = count_unknown_age_excluded(age_stratum_for_unknown_check)
     if unknown_excluded is not None:
         st.info(
-            f"Filtro eta attivo ('{age_stratum_for_unknown_check}'): "
-            f"**{unknown_excluded:,}** report con eta non registrata (`age_stratum = 'unknown'`) "
-            f"sono esclusi sia dal gruppo target che dalla baseline di confronto, "
-            f"poiche non e possibile attribuirli con certezza a nessuna fascia."
+            f"Age filter active ('{age_stratum_for_unknown_check}'): "
+            f"**{unknown_excluded:,}** the report has no age registered (`age_stratum = 'unknown'`) "
+            f"they are excluded both from the target group and from the baseline of comparison, "
+            f"thus it is not possible with certainty to link them to any filter."
         )
 
-    with st.spinner("Eseguo la pipeline completa..."):
+    with st.spinner("Working..."):
         try:
             results = run_pipeline(config)
         except Exception as e:
-            st.error(f"Errore durante l'esecuzione della pipeline: {e}")
+            st.error(f"Error during pipeline execution: {e}")
             return
 
     if results.get("error") == "no_data":
-        st.error(f"Nessuna coppia trovata per '{config['target_drug']}' con questi filtri.")
+        st.error(f"No couple found for '{config['target_drug']}' with these filters.")
         return
 
     # --- Contingency table ---
@@ -177,7 +177,8 @@ def run_and_display(config: dict, age_stratum_for_unknown_check: str | None = No
         key="download_ct",
     )
 
-    # --- Risultati per algoritmo ---
+   # Secondo me questo non ci serve (da risultati singoli per ogni modello PRR/ROR/...) 
+    """# --- Risultati per algoritmo ---
     st.subheader("Risultati per algoritmo")
     algo_tabs = st.tabs([a.upper() for a in config["algorithms"]])
     for tab, algo in zip(algo_tabs, config["algorithms"]):
@@ -195,7 +196,7 @@ def run_and_display(config: dict, age_stratum_for_unknown_check: str | None = No
                     file_name=f"{config['target_drug']}_{algo}.csv",
                     mime="text/csv",
                     key=f"download_{algo}",
-                )
+                )"""
 
     # --- Validazione label FDA ---
     st.subheader("Validazione label FDA")
@@ -211,7 +212,7 @@ def run_and_display(config: dict, age_stratum_for_unknown_check: str | None = No
     if weber:
         st.json(weber)
     else:
-        st.info("Weber check disabilitato o nessun dato disponibile.")
+        st.info("Weber check disabled or no data present.")
 
     # --- Run summary ---
     st.subheader("Run summary")
@@ -291,7 +292,7 @@ with col4:
 
 
 # ---------------------------------------------------------------------------
-# Parametri avanzati
+# Parametri avanzati [Anche questo secondo me non serve]
 # ---------------------------------------------------------------------------
 with st.expander("Parametri avanzati"):
     adv_col1, adv_col2 = st.columns(2)
