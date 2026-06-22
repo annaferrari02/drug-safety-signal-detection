@@ -42,10 +42,25 @@ _PRINCIPI_ATTIVI_PATH = Path(__file__).resolve().parent.parent / "principi_attiv
 def load_principi_attivi() -> list[str]:
     """
     Carica la lista dei principi attivi da principi_attivi.json.
-    Fallback a lista vuota se il file non esiste.
+
+    Path atteso (sia in locale che nel container Docker):
+        <project_root>/principi_attivi.json
+    dove <project_root> = due livelli sopra src/text_to_sql.py.
+
+    Fallback a lista vuota con warning se il file non esiste —
+    in quel caso resolve_drug_name_mistral restituisce sempre None.
     """
     if _PRINCIPI_ATTIVI_PATH.exists():
-        return json.loads(_PRINCIPI_ATTIVI_PATH.read_text(encoding="utf-8"))
+        data = json.loads(_PRINCIPI_ATTIVI_PATH.read_text(encoding="utf-8"))
+        return data
+    import warnings
+    warnings.warn(
+        f"[text_to_sql] principi_attivi.json non trovato in {_PRINCIPI_ATTIVI_PATH}. "
+        f"Il fallback Mistral non potrà risolvere i nomi farmaco. "
+        f"Aggiungi il file alla root del progetto e assicurati che il Dockerfile "
+        f"lo includa con: COPY principi_attivi.json .",
+        stacklevel=2,
+    )
     return []
 
 PRINCIPI_ATTIVI: list[str] = load_principi_attivi()
@@ -69,53 +84,54 @@ def _make_client(api_key: str):
 _DRUG_RESOLUTION_SYSTEM = """You are a pharmacology expert with deep knowledge of drug names,
 brand names, INN (International Nonproprietary Names), and trade names in all languages.
 
-Your only job is to map a drug name provided by the user to the single best match
-from the following list of allowed drug names. The list is exhaustive — you must
-choose from it and only from it.
+Your only job is to identify the English INN (International Nonproprietary Name) of the drug
+the user is referring to, regardless of the language, spelling, or brand name used.
 
-Rules:
-- Return ONLY the exact string from the list, in UPPERCASE, with no explanation.
-- If the user provides a brand name (e.g. "Brufen", "Tachipirina", "Voltaren"),
-  map it to the corresponding entry in the list.
-- If the user provides a name in another language (Italian, French, Spanish, etc.),
-  translate and map it to the correct entry.
-- If multiple entries are plausible, pick the most specific one
-  (e.g. prefer "IBUPROFEN" over "IBUPROPHEN" for "brufen").
-- If no entry in the list matches the input at all, return exactly: NONE
-- Never return anything other than one entry from the list or NONE.
+Steps you must follow internally:
+1. Identify the drug the user means (brand name, foreign spelling, abbreviation, etc.)
+2. Return its English INN in UPPERCASE
 
-Allowed drug names:
-{drug_list}
+Examples:
+  "ketoprofene"    → KETOPROFEN
+  "brufen"         → IBUPROFEN
+  "tachipirina"    → ACETAMINOPHEN
+  "aspirine"       → ASPIRIN
+  "cardioaspirina" → ASPIRIN
+  "voltaren"       → DICLOFENAC
+  "moment"         → IBUPROFEN
+  "paracetamolo"   → ACETAMINOPHEN
+  "ibuprofene"     → IBUPROFEN
+  "cortisone"      → HYDROCORTISONE
+  "lasix"          → FUROSEMIDE
+
+Output rules:
+- Return ONLY the English INN in UPPERCASE
+- No explanation, no punctuation, no extra words
+- If you cannot identify the drug with confidence, return exactly: NONE
 """
 
 def resolve_drug_name_mistral(
     user_input: str,
-    drug_list: list[str] | None = None,
+    drug_list: list[str] | None = None,   # non usato, mantenuto per compatibilità
     api_key: str | None = None,
     retries: int = 3,
 ) -> str | None:
     """
-    Mappa il nome farmaco inserito dall'utente a un principio attivo nella lista.
+    Identifica il principio attivo INN in inglese del farmaco inserito dall'utente.
 
-    Chiamata da appli.py come fallback quando rapidfuzz non trova un match
-    con score >= 75. Restituisce il nome esatto dalla lista (UPPERCASE) o None.
+    Mistral si occupa solo di traduzione/identificazione farmacologica —
+    restituisce l'INN in inglese (es. "ketoprofene" → "KETOPROFEN").
+    Il matching ortografico contro il dataset reale è delegato a rapidfuzz
+    in appli.py, che riceve l'INN e lo confronta con drug_index del Parquet.
 
-    Parameters
-    ----------
-    user_input : str
-        Nome farmaco inserito dall'utente (qualsiasi lingua, qualsiasi case).
-    drug_list : list[str] | None
-        Lista dei principi attivi validi. Se None, usa PRINCIPI_ATTIVI
-        caricata da principi_attivi.json.
-    api_key : str | None
-        Chiave API Mistral. Se None, tenta di leggerla da MISTRAL_API_KEY in env.
-    retries : int
-        Numero di tentativi in caso di rate limit (429).
+    Vantaggi rispetto al passare la lista completa a Mistral:
+    - Prompt piccolo e veloce (nessuna lista nel contesto)
+    - Nessuna allucinazione sul nome esatto: rapidfuzz garantisce il match
+    - Funziona anche per farmaci non nella lista originale principi_attivi.json
 
     Returns
     -------
-    str | None
-        Nome esatto dalla lista in UPPERCASE, oppure None se nessun match.
+    str | None — INN in inglese UPPERCASE, oppure None se non identificato
     """
     import os
 
@@ -123,44 +139,31 @@ def resolve_drug_name_mistral(
     if not resolved_key:
         return None
 
-    active_list = drug_list if drug_list is not None else PRINCIPI_ATTIVI
-    if not active_list:
-        return None
-
-    # Formatta la lista come stringa numerata per il prompt
-    list_str = "\n".join(f"- {name}" for name in active_list)
-    system_prompt = _DRUG_RESOLUTION_SYSTEM.format(drug_list=list_str)
-
     client = _make_client(resolved_key)
 
     for attempt in range(retries):
         try:
             response = client.chat.completions.create(
                 model="mistral-small-latest",
-                temperature=0,   # deterministico: vogliamo sempre lo stesso match
+                temperature=0,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": _DRUG_RESOLUTION_SYSTEM},
                     {"role": "user",   "content": user_input.strip()},
                 ],
             )
             result = response.choices[0].message.content.strip().upper()
 
-            # Validazione: il risultato deve essere nella lista o "NONE"
-            if result == "NONE":
+            if result == "NONE" or not result:
                 return None
-            if result in [d.upper() for d in active_list]:
-                # Restituisce la versione esatta dalla lista (case originale)
-                for name in active_list:
-                    if name.upper() == result:
-                        return name
-            # Se Mistral ha restituito qualcosa di non riconosciuto, None
-            return None
+
+            # Restituisce l'INN — rapidfuzz in appli.py farà il match sul dataset
+            return result
 
         except Exception as e:
             if "429" in str(e) and attempt < retries - 1:
-                time.sleep(2 ** attempt)   # backoff: 1s, 2s, 4s
+                time.sleep(2 ** attempt)
                 continue
-            return None   # in caso di errore non bloccante, None è il fallback sicuro
+            return None
 
     return None
 

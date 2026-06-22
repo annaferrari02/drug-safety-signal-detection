@@ -10,5 +10,13 @@
   "ketoprofen": {
     "year": 1993,
     "source": "openfda"
+  },
+  "tachipirina": {
+    "year": null,
+    "source": "unknown"
+  },
+  "paracetamol": {
+    "year": null,
+    "source": "unknown"
   }
 }

@@ -10,6 +10,18 @@ services:
     profiles:
       - pipeline
 
+  prepare:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile      # riusa la stessa immagine di ingestion
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python run_prepare.py
+    profiles:
+      - pipeline
+
   signals:
     build:
       context: .

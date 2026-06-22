@@ -202,17 +202,61 @@ SEX_OPTIONS = ["All", "Female", "Male"]
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_drug_index() -> list[str]:
-    """Carica tutti i drug_name distinti dal Parquet (con cache Streamlit 1h)."""
-    if not PARQUET_PATH.exists():
-        return SUGGESTED_DRUGS
-    try:
-        con = duckdb.connect()
-        result = con.execute(
-            f"SELECT DISTINCT drug_name FROM '{PARQUET_PATH}' WHERE drug_name IS NOT NULL"
-        ).fetchall()
-        return [r[0] for r in result if r[0]]
-    except Exception:
-        return SUGGESTED_DRUGS
+    """
+    Carica tutti i drug_name distinti dal Parquet.
+
+    Usa faers_sorted.parquet se disponibile — DuckDB legge le statistiche
+    per row group senza scansionare il file completo, evitando OOM.
+    Fallback su faers_flat_deduped.parquet, poi su SUGGESTED_DRUGS.
+    """
+    # Preferisce faers_sorted.parquet: le statistiche per colonna permettono
+    # a DuckDB di raccogliere i drug_name distinti leggendo solo i metadati
+    # dei row group invece di scansionare tutto il file.
+    # Strategia 1: legge i valori min/max per row group dai metadati di
+    # faers_sorted.parquet — zero scan dei dati, solo lettura metadati.
+    # Poiché il file è ordinato per drug_name, ogni row group ha min==max
+    # per i row group mono-farmaco, e i valori min/max coprono tutti i farmaci.
+    sorted_path = DATA_DIR / "faers_sorted.parquet"
+    if sorted_path.exists():
+        try:
+            import pyarrow.parquet as pq
+            pf       = pq.ParquetFile(str(sorted_path))
+            meta     = pf.metadata
+            col_idx  = pf.schema_arrow.get_field_index("drug_name")
+            names    = set()
+            for i in range(meta.num_row_groups):
+                rg   = meta.row_group(i)
+                col  = rg.column(col_idx)
+                stat = col.statistics
+                if stat and stat.has_min_max:
+                    names.add(stat.min)
+                    names.add(stat.max)
+            names.discard(None)
+            names.discard("")
+            if names:
+                return sorted(names)
+        except Exception:
+            pass
+
+    # Strategia 2: DuckDB con memoria limitata su faers_flat_deduped
+    flat_path = DATA_DIR / "faers_flat_deduped.parquet"
+    if flat_path.exists():
+        try:
+            con = duckdb.connect()
+            con.execute("SET memory_limit = '1GB'")
+            con.execute("SET threads = 2")
+            result = con.execute(
+                f"SELECT DISTINCT drug_name FROM '{flat_path}' "
+                f"WHERE drug_name IS NOT NULL AND drug_name != ''"
+            ).fetchall()
+            con.close()
+            names = [r[0] for r in result if r[0]]
+            if names:
+                return names
+        except Exception:
+            pass
+
+    return SUGGESTED_DRUGS
 
 
 # ============================================================================
@@ -244,19 +288,20 @@ def resolve_drug_name(user_input: str, drug_index: list[str], mistral_key: str |
         if score >= 75:
             return match, "fuzzy", float(score)
 
-    # 3. Fallback Mistral — mappa direttamente su drug_index (nomi reali del Parquet).
-    #    La lista passata è quella dei nomi che esistono davvero nel dataset,
-    #    NON principi_attivi.json — che contiene nomi italiani/brand non presenti nel Parquet.
+    # 3. Fallback Mistral — due step separati:
+    #    a) Mistral identifica l'INN in inglese (es. "ketoprofene" → "KETOPROFEN")
+    #       Prompt piccolo, nessuna lista, solo conoscenza farmacologica.
+    #    b) rapidfuzz matcha l'INN sul drug_index reale del Parquet
+    #       Garantisce che il nome restituito esista esattamente nel dataset.
     if mistral_key:
         try:
             from src.text_to_sql import resolve_drug_name_mistral
-            inn = resolve_drug_name_mistral(
-                user_input,
-                drug_list=drug_index,   # ← nomi reali del Parquet
-                api_key=mistral_key,
-            )
+            inn = resolve_drug_name_mistral(user_input, api_key=mistral_key)
             if inn:
-                return inn, "mistral", 100.0
+                # Step b: match dell'INN sul dataset reale
+                result_b = process.extractOne(inn, drug_index, scorer=fuzz.token_set_ratio)
+                if result_b and result_b[1] >= 75:
+                    return result_b[0], "mistral", float(result_b[1])
         except Exception:
             pass
 

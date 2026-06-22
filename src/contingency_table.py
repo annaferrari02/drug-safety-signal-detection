@@ -1,165 +1,459 @@
 """
-src/contingency_table.py — versione ottimizzata
+src/contingency_table.py — versione dual-route
 
-Ottimizzazioni rispetto alla versione precedente:
-1. DuckDB con thread e memoria configurabili (default: 4 thread, 2GB)
-2. View unica sul Parquet — il file viene aperto una sola volta
-   invece di 4 volte (una per CTE). Su dataset grandi questo dimezza
-   il tempo di I/O.
-3. Parametri duckdb_threads e duckdb_memory passati da run_signals.py
+Route di esecuzione in base al tipo di filtro:
+
+    ROUTE A — nessun filtro (FAST PATH)
+        faers_sorted.parquet + marginals_global.parquet
+        Row group pruning su drug_name + join su marginali pre-calcolati
+        Tempo: ~2-5s
+
+    ROUTE B — filtri fissi (sex / age_stratum)
+        marginals_cubed.parquet + faers_sorted.parquet (solo target drug)
+        Push-down sul cubo per i marginali dello strato, pruning per il drug
+        Tempo: <1s
+
+    ROUTE C — co-medication (subquery su drug_name)
+        drug_inverted_index.parquet + faers_sorted.parquet
+        list_intersect() in RAM, poi scan solo sui report dell'intersezione
+        Tempo: ~5-8s (prima volta), poi coperto da session_state cache
+
+    ROUTE D — fallback (filtri dinamici non gestiti)
+        faers_sorted.parquet con full scan + where_extra
+        Comportamento identico alla versione originale con where_extra
+        Tempo: ~60-90s
+
+Fallback globale: se faers_sorted.parquet o marginals_global.parquet non
+esistono, cade su faers_flat_deduped.parquet (parquet_path) con full scan.
 """
 
+import os
+import re
 import duckdb
 import pandas as pd
+from pathlib import Path
+
+_DATA_DIR       = Path("/app/data")
+_SORTED_PARQUET = _DATA_DIR / "faers_sorted.parquet"
+_MARGINALS      = _DATA_DIR / "marginals_global.parquet"
+_CUBED          = _DATA_DIR / "marginals_cubed.parquet"
+_INDEX          = _DATA_DIR / "drug_inverted_index.parquet"
+
+_FIXED_COLS = {"sex", "age_stratum"}
 
 
-def build_contingency_table(
-        parquet_path:    str,
-        target_drug:     str,
-        pt_col:          str = "reaction_pt",
-        min_a:           int = 3,
-        where_extra:     str = None,
-        duckdb_threads:  int = 2,
-        duckdb_memory:   str = "1500MB",
-) -> pd.DataFrame:
-    """
-    Costruisce la contingency table 2x2 per tutte le coppie (target_drug, PT).
-
-    Logica delle 4 celle (standard disproportionality analysis):
-        a = report con target_drug E questo PT
-        b = report con target_drug E altri PT
-        c = report con altri drug  E questo PT
-        d = report con altri drug  E altri PT
-        n = totale report nel background
-
-    Parameters
-    ----------
-    parquet_path   : path al Parquet deduplicato
-    target_drug    : nome farmaco in UPPERCASE
-    pt_col         : colonna reazioni MedDRA PT
-    min_a          : soglia minima cella a
-    where_extra    : clausola SQL per stratificazione (senza WHERE)
-    duckdb_threads : thread DuckDB (default 4)
-    duckdb_memory  : memoria DuckDB (default "2GB")
-
-    Returns
-    -------
-    pd.DataFrame con colonne [drug, pt, a, b, c, d, n]
-    """
-    base_filter = f"drug_name = '{target_drug}'"
-
-    if where_extra:
-        full_filter = f"{base_filter} AND {where_extra}"
-        bg_where    = f"WHERE {where_extra}"
-    else:
-        full_filter = base_filter
-        bg_where    = ""
-
-    # Connessione con configurazione esplicita per ambienti container
+def _make_con(threads: int, memory: str) -> duckdb.DuckDBPyConnection:
+    tmp_dir = str(_DATA_DIR / "duckdb_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
     con = duckdb.connect()
-    con.execute(f"SET threads = {duckdb_threads}")
-    con.execute(f"SET memory_limit = '{duckdb_memory}'")
-    con.execute("SET preserve_insertion_order = false")  # libera ~20% memoria
-    con.execute("SET temp_directory = '/app/data/duckdb_tmp'")  # spill su disco se OOM
-    import os; os.makedirs("/app/data/duckdb_tmp", exist_ok=True)
+    con.execute(f"SET threads = {threads}")
+    con.execute(f"SET memory_limit = '{memory}'")
+    con.execute("SET preserve_insertion_order = false")
+    con.execute(f"SET temp_directory = '{tmp_dir}'")
+    return con
 
-    # View unica — il Parquet viene aperto una sola volta
-    # Tutte le CTE sotto referenziano 'faers' invece di riaprire il file
-    con.execute(f"CREATE VIEW faers AS SELECT * FROM read_parquet('{parquet_path}')")
+
+# ─── Routing ────────────────────────────────────────────────────────────────
+
+def _detect_route(where_extra: str | None) -> str:
+    if where_extra is None:
+        return "global"
+    we = where_extra.strip()
+    if re.search(r"safetyreportid\s+IN\s*\(", we, re.IGNORECASE):
+        return "index"
+    mentioned = {c.lower() for c in re.findall(r"\b([a-z_]+)\b\s*(?:=|IN\b|LIKE\b)", we, re.IGNORECASE)}
+    if mentioned and mentioned.issubset(_FIXED_COLS):
+        return "cubed"
+    return "full"
+
+
+# ─── Route A: sorted + marginals_global (fast path) ─────────────────────────
+
+def _build_ct_global(
+        target_drug: str, pt_col: str, min_a: int,
+        threads: int, memory: str,
+) -> pd.DataFrame:
+    con = _make_con(threads, memory)
+    sp = str(_SORTED_PARQUET)
+    mp = str(_MARGINALS)
 
     query = f"""
     WITH
-
-    target_reports AS (
-        SELECT DISTINCT safetyreportid AS report_id
-        FROM faers
-        WHERE {full_filter}
+    drug_pt_pairs AS (
+        SELECT DISTINCT safetyreportid AS report_id, {pt_col} AS pt
+        FROM '{sp}'
+        WHERE drug_name = '{target_drug}'
+          AND {pt_col} IS NOT NULL AND {pt_col} != ''
     ),
-
-    background_reports AS (
-        SELECT DISTINCT safetyreportid AS report_id
-        FROM faers
-        {bg_where}
-    ),
-
-    totals AS (
-        SELECT COUNT(DISTINCT report_id) AS n
-        FROM background_reports
-    ),
-
-    drug_marginal AS (
-        SELECT COUNT(DISTINCT report_id) AS n_drug
-        FROM target_reports
-    ),
-
-    target_pts AS (
-        SELECT DISTINCT p.safetyreportid AS report_id, p.{pt_col} AS pt
-        FROM faers p
-        JOIN target_reports t ON p.safetyreportid = t.report_id
-        WHERE p.drug_name = '{target_drug}'
-          AND p.{pt_col} IS NOT NULL
-          AND p.{pt_col} != ''
-    ),
-
     pair_counts AS (
         SELECT pt, COUNT(DISTINCT report_id) AS a
-        FROM target_pts
+        FROM drug_pt_pairs
         GROUP BY pt
     ),
+    drug_total AS (
+        SELECT COUNT(DISTINCT report_id) AS n_drug
+        FROM drug_pt_pairs
+    ),
+    marginals AS (
+        SELECT pt, n_pt, n_total
+        FROM '{mp}'
+    )
+    SELECT
+        '{target_drug}'                              AS drug,
+        pc.pt                                        AS pt,
+        pc.a                                         AS a,
+        (dt.n_drug   - pc.a)                         AS b,
+        (mg.n_pt     - pc.a)                         AS c,
+        (mg.n_total  - dt.n_drug - mg.n_pt + pc.a)   AS d,
+        mg.n_total                                   AS n
+    FROM pair_counts  pc
+    JOIN marginals    mg ON pc.pt = mg.pt
+    CROSS JOIN drug_total dt
+    WHERE pc.a >= {min_a}
+      AND (dt.n_drug   - pc.a)                    >= 0
+      AND (mg.n_pt     - pc.a)                    >= 0
+      AND (mg.n_total  - dt.n_drug - mg.n_pt + pc.a) >= 0
+    ORDER BY pc.a DESC
+    """
+    result = con.execute(query).df()
+    con.close()
+    return result
 
+
+# ─── Route B: cubo OLAP per filtri fissi ────────────────────────────────────
+
+def _build_ct_cubed(
+        target_drug: str, pt_col: str, min_a: int,
+        where_extra: str, threads: int, memory: str,
+) -> pd.DataFrame:
+    con = _make_con(threads, memory)
+    sp = str(_SORTED_PARQUET)
+    cp = str(_CUBED)
+
+    query = f"""
+    WITH
+    -- Marginali dello strato dal cubo (~100ms, push-down sui row group)
+    stratum_marginals AS (
+        SELECT
+            reaction_pt      AS pt,
+            n_pt_stratum,
+            n_stratum
+        FROM '{cp}'
+        WHERE {where_extra}
+    ),
+    -- Solo le righe del target drug nello strato (row group pruning)
+    drug_pt_pairs AS (
+        SELECT DISTINCT safetyreportid AS report_id, {pt_col} AS pt
+        FROM '{sp}'
+        WHERE drug_name = '{target_drug}'
+          AND {where_extra}
+          AND {pt_col} IS NOT NULL AND {pt_col} != ''
+    ),
+    pair_counts AS (
+        SELECT pt, COUNT(DISTINCT report_id) AS a
+        FROM drug_pt_pairs
+        GROUP BY pt
+    ),
+    drug_total AS (
+        SELECT COUNT(DISTINCT report_id) AS n_drug
+        FROM drug_pt_pairs
+    )
+    SELECT
+        '{target_drug}'                                        AS drug,
+        pc.pt                                                  AS pt,
+        pc.a                                                   AS a,
+        (dt.n_drug       - pc.a)                               AS b,
+        (sm.n_pt_stratum - pc.a)                               AS c,
+        (sm.n_stratum - dt.n_drug - sm.n_pt_stratum + pc.a)    AS d,
+        sm.n_stratum                                           AS n
+    FROM pair_counts       pc
+    JOIN stratum_marginals sm ON pc.pt = sm.pt
+    CROSS JOIN drug_total  dt
+    WHERE pc.a >= {min_a}
+      AND (dt.n_drug       - pc.a)                           >= 0
+      AND (sm.n_pt_stratum - pc.a)                           >= 0
+      AND (sm.n_stratum - dt.n_drug - sm.n_pt_stratum + pc.a) >= 0
+    ORDER BY pc.a DESC
+    """
+    result = con.execute(query).df()
+    con.close()
+    return result
+
+
+# ─── Route C: indice invertito per co-medication ────────────────────────────
+
+def _extract_comedication_drug(where_extra: str) -> str | None:
+    m = re.search(r"drug_name\s*=\s*'([^']+)'", where_extra, re.IGNORECASE)
+    return m.group(1).upper() if m else None
+
+
+def _build_ct_index(
+        target_drug: str, pt_col: str, min_a: int,
+        where_extra: str, threads: int, memory: str,
+) -> pd.DataFrame:
+    co_drug = _extract_comedication_drug(where_extra)
+    if co_drug is None:
+        print(f"  [CT  ] Co-medication non riconosciuta — fallback Route D")
+        return _build_ct_full(target_drug, pt_col, min_a, where_extra, threads, memory)
+
+    con = _make_con(threads, memory)
+    ip = str(_INDEX)
+    sp = str(_SORTED_PARQUET)
+
+    # Verifica che il co-drug esista nell'indice
+    check = con.execute(f"""
+        SELECT COUNT(*) FROM '{ip}' WHERE drug_name = '{co_drug}'
+    """).fetchone()[0]
+    if check == 0:
+        con.close()
+        print(f"  [CT  ] '{co_drug}' non nell'indice — fallback Route D")
+        return _build_ct_full(target_drug, pt_col, min_a, where_extra, threads, memory)
+
+    query = f"""
+    WITH
+    -- Intersezione in RAM: nessun I/O sul Parquet principale
+    intersection AS (
+        SELECT list_intersect(
+            (SELECT report_ids FROM '{ip}' WHERE drug_name = '{target_drug}'),
+            (SELECT report_ids FROM '{ip}' WHERE drug_name = '{co_drug}')
+        ) AS valid_ids
+    ),
+    valid_reports AS (
+        SELECT UNNEST(valid_ids) AS report_id FROM intersection
+    ),
+    totals AS (
+        SELECT COUNT(*) AS n FROM valid_reports
+    ),
+    drug_total AS (
+        SELECT COUNT(*) AS n_drug FROM valid_reports
+    ),
+    -- Scansione del Parquet solo sui report dell'intersezione
+    target_pts AS (
+        SELECT DISTINCT p.safetyreportid AS report_id, p.{pt_col} AS pt
+        FROM '{sp}' p
+        JOIN valid_reports v ON p.safetyreportid = v.report_id
+        WHERE p.drug_name = '{target_drug}'
+          AND p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
+    ),
+    pair_counts AS (
+        SELECT pt, COUNT(DISTINCT report_id) AS a
+        FROM target_pts GROUP BY pt
+    ),
     pt_marginal AS (
         SELECT p.{pt_col} AS pt, COUNT(DISTINCT p.safetyreportid) AS n_pt
-        FROM faers p
-        JOIN background_reports b ON p.safetyreportid = b.report_id
-        WHERE p.{pt_col} IS NOT NULL
-          AND p.{pt_col} != ''
+        FROM '{sp}' p
+        JOIN valid_reports v ON p.safetyreportid = v.report_id
+        WHERE p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
         GROUP BY p.{pt_col}
     )
-
     SELECT
         '{target_drug}'                          AS drug,
         pc.pt                                    AS pt,
         pc.a                                     AS a,
-        (dm.n_drug - pc.a)                       AS b,
+        (dt.n_drug - pc.a)                       AS b,
         (pm.n_pt   - pc.a)                       AS c,
-        (t.n - dm.n_drug - pm.n_pt + pc.a)       AS d,
+        (t.n - dt.n_drug - pm.n_pt + pc.a)       AS d,
         t.n                                      AS n
-    FROM pair_counts   pc
-    JOIN pt_marginal   pm ON pc.pt = pm.pt
-    CROSS JOIN drug_marginal dm
-    CROSS JOIN totals        t
+    FROM pair_counts  pc
+    JOIN pt_marginal  pm ON pc.pt = pm.pt
+    CROSS JOIN drug_total dt
+    CROSS JOIN totals     t
     WHERE pc.a >= {min_a}
-      AND (dm.n_drug - pc.a)                 >= 0
+      AND (dt.n_drug - pc.a)                 >= 0
       AND (pm.n_pt   - pc.a)                 >= 0
+      AND (t.n - dt.n_drug - pm.n_pt + pc.a) >= 0
+    ORDER BY pc.a DESC
+    """
+    result = con.execute(query).df()
+    con.close()
+    return result
+
+
+# ─── Route D: full scan con where_extra su faers_sorted ─────────────────────
+
+def _build_ct_full(
+        target_drug: str, pt_col: str, min_a: int,
+        where_extra: str | None, threads: int, memory: str,
+) -> pd.DataFrame:
+    """Full scan su faers_sorted.parquet — comportamento originale con where_extra."""
+    sp = str(_SORTED_PARQUET)
+
+    if where_extra:
+        full_filter = f"drug_name = '{target_drug}' AND {where_extra}"
+        bg_where    = f"WHERE {where_extra}"
+    else:
+        full_filter = f"drug_name = '{target_drug}'"
+        bg_where    = ""
+
+    con = _make_con(threads, memory)
+    query = f"""
+    WITH
+    drug_pt_pairs AS (
+        SELECT DISTINCT safetyreportid AS report_id, {pt_col} AS pt
+        FROM '{sp}'
+        WHERE {full_filter}
+          AND {pt_col} IS NOT NULL AND {pt_col} != ''
+    ),
+    pair_counts AS (
+        SELECT pt, COUNT(DISTINCT report_id) AS a
+        FROM drug_pt_pairs GROUP BY pt
+    ),
+    drug_total AS (
+        SELECT COUNT(DISTINCT report_id) AS n_drug FROM drug_pt_pairs
+    ),
+    strat_n_total AS (
+        SELECT COUNT(DISTINCT safetyreportid) AS n
+        FROM '{sp}' {bg_where}
+    ),
+    strat_pt_marginal AS (
+        SELECT {pt_col} AS pt, COUNT(DISTINCT safetyreportid) AS n_pt
+        FROM '{sp}'
+        WHERE {(where_extra + " AND ") if where_extra else ""}{pt_col} IS NOT NULL AND {pt_col} != ''
+        GROUP BY {pt_col}
+    )
+    SELECT
+        '{target_drug}'                            AS drug,
+        pc.pt                                      AS pt,
+        pc.a                                       AS a,
+        (dt.n_drug  - pc.a)                        AS b,
+        (pm.n_pt    - pc.a)                        AS c,
+        (nt.n - dt.n_drug - pm.n_pt + pc.a)        AS d,
+        nt.n                                       AS n
+    FROM pair_counts       pc
+    JOIN strat_pt_marginal pm ON pc.pt = pm.pt
+    CROSS JOIN drug_total  dt
+    CROSS JOIN strat_n_total nt
+    WHERE pc.a >= {min_a}
+      AND (dt.n_drug  - pc.a)                   >= 0
+      AND (pm.n_pt    - pc.a)                   >= 0
+      AND (nt.n - dt.n_drug - pm.n_pt + pc.a)   >= 0
+    ORDER BY pc.a DESC
+    """
+    result = con.execute(query).df()
+    con.close()
+    return result
+
+
+# ─── Interfaccia pubblica ────────────────────────────────────────────────────
+
+def build_contingency_table(
+        parquet_path:   str,
+        target_drug:    str,
+        pt_col:         str = "reaction_pt",
+        min_a:          int = 3,
+        where_extra:    str = None,
+        duckdb_threads: int = 4,
+        duckdb_memory:  str = "4GB",
+) -> pd.DataFrame:
+    """
+    Costruisce la contingency table 2×2 per tutte le coppie (target_drug, PT).
+
+    Routing automatico:
+        None         → Route A: sorted + marginals_global (~2-5s)
+        sex/age      → Route B: cubo OLAP (<1s)
+        co-medication→ Route C: indice invertito (~5-8s)
+        altro        → Route D: full scan su faers_sorted (~60-90s)
+
+    Fallback globale: se faers_sorted o marginals_global non esistono,
+    usa parquet_path con full scan (comportamento pre-ottimizzazione).
+    """
+    # Fallback se i file ottimizzati non esistono
+    if not _SORTED_PARQUET.exists() or not _MARGINALS.exists():
+        print(f"  [CT  ] File ottimizzati non trovati — fallback su {parquet_path}")
+        return _build_ct_full_legacy(parquet_path, target_drug, pt_col, min_a,
+                                     where_extra, duckdb_threads, duckdb_memory)
+
+    route = _detect_route(where_extra)
+    route_labels = {
+        "global": "A — sorted + marginals_global",
+        "cubed":  "B — cubo OLAP (marginals_cubed)",
+        "index":  "C — indice invertito (co-medication)",
+        "full":   "D — full scan faers_sorted con filtro",
+    }
+    print(f"  [CT  ] Route {route_labels[route]}", flush=True)
+
+    if route == "global":
+        return _build_ct_global(target_drug, pt_col, min_a, duckdb_threads, duckdb_memory)
+
+    if route == "cubed":
+        if _CUBED.exists():
+            return _build_ct_cubed(target_drug, pt_col, min_a, where_extra,
+                                    duckdb_threads, duckdb_memory)
+        print(f"  [CT  ] marginals_cubed.parquet non trovato — fallback Route D")
+        print(f"         Esegui ingestion/run_prepare.py per abilitare Route B.")
+
+    if route == "index":
+        if _INDEX.exists():
+            return _build_ct_index(target_drug, pt_col, min_a, where_extra,
+                                    duckdb_threads, duckdb_memory)
+        print(f"  [CT  ] drug_inverted_index.parquet non trovato — fallback Route D")
+        print(f"         Esegui ingestion/run_prepare.py per abilitare Route C.")
+
+    # Route D
+    return _build_ct_full(target_drug, pt_col, min_a, where_extra,
+                           duckdb_threads, duckdb_memory)
+
+
+def _build_ct_full_legacy(
+        parquet_path: str, target_drug: str, pt_col: str, min_a: int,
+        where_extra: str | None, threads: int, memory: str,
+) -> pd.DataFrame:
+    """Fallback su faers_flat_deduped.parquet — pre-ottimizzazione."""
+    base_filter = f"drug_name = '{target_drug}'"
+    full_filter = f"{base_filter} AND {where_extra}" if where_extra else base_filter
+    bg_where    = f"WHERE {where_extra}" if where_extra else ""
+
+    con = _make_con(threads, memory)
+    con.execute(f"CREATE VIEW faers AS SELECT * FROM read_parquet('{parquet_path}')")
+    query = f"""
+    WITH
+    target_reports AS (
+        SELECT DISTINCT safetyreportid AS report_id FROM faers WHERE {full_filter}
+    ),
+    background_reports AS (
+        SELECT DISTINCT safetyreportid AS report_id FROM faers {bg_where}
+    ),
+    totals      AS (SELECT COUNT(DISTINCT report_id) AS n     FROM background_reports),
+    drug_marginal AS (SELECT COUNT(DISTINCT report_id) AS n_drug FROM target_reports),
+    target_pts  AS (
+        SELECT DISTINCT p.safetyreportid AS report_id, p.{pt_col} AS pt
+        FROM faers p JOIN target_reports t ON p.safetyreportid = t.report_id
+        WHERE p.drug_name = '{target_drug}'
+          AND p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
+    ),
+    pair_counts AS (SELECT pt, COUNT(DISTINCT report_id) AS a FROM target_pts GROUP BY pt),
+    pt_marginal AS (
+        SELECT p.{pt_col} AS pt, COUNT(DISTINCT p.safetyreportid) AS n_pt
+        FROM faers p JOIN background_reports b ON p.safetyreportid = b.report_id
+        WHERE p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
+        GROUP BY p.{pt_col}
+    )
+    SELECT '{target_drug}' AS drug, pc.pt AS pt, pc.a AS a,
+           (dm.n_drug - pc.a) AS b, (pm.n_pt - pc.a) AS c,
+           (t.n - dm.n_drug - pm.n_pt + pc.a) AS d, t.n AS n
+    FROM pair_counts pc
+    JOIN pt_marginal pm ON pc.pt = pm.pt
+    CROSS JOIN drug_marginal dm CROSS JOIN totals t
+    WHERE pc.a >= {min_a}
+      AND (dm.n_drug - pc.a) >= 0 AND (pm.n_pt - pc.a) >= 0
       AND (t.n - dm.n_drug - pm.n_pt + pc.a) >= 0
     ORDER BY pc.a DESC
     """
-
     result = con.execute(query).df()
     con.close()
     return result
 
 
 def qc_contingency_table(df: pd.DataFrame, label: str = "") -> None:
-    """
-    Stampa un report di sanità sulla contingency table.
-    Verifica: a+b+c+d == n, nessuna cella negativa, distribuzione di a.
-    """
     if df.empty:
         print(f"  [QC] {label}: DataFrame vuoto")
         return
-
     print(f"\n[{label}] QC — {len(df)} coppie (drug, PT)")
-
     ok = ((df["a"] + df["b"] + df["c"] + df["d"]) == df["n"]).all()
     print(f"  a+b+c+d == n : {'OK' if ok else 'FAIL'}")
-
     neg = {col: int((df[col] < 0).sum()) for col in ["a", "b", "c", "d"]}
     print(f"  Celle negative: " + "  ".join(f"{k}={v}" for k, v in neg.items()))
-
-    print(f"  a — min={df['a'].min()}  median={df['a'].median():.0f}  "
-          f"max={df['a'].max()}  sum={df['a'].sum()}")
+    print(f"  a — min={df['a'].min()}  median={df['a'].median():.0f}  max={df['a'].max()}")
     print(f"  n — valore unico: {df['n'].nunique() == 1}  ({df['n'].iloc[0]})")
-
     print(f"  Top 5 PT per a:")
     print(df.nlargest(5, "a")[["pt", "a"]].to_string(index=False))

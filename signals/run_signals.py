@@ -53,7 +53,7 @@ from src.signals import compute_prr, compute_ror, compute_bcpnn, compute_mgps
 from src.validate_label import validate_signals, validation_summary
 from src.weber_check import check_weber_effect, weber_summary
 
-PARQUET_PATH = Path(__file__).resolve().parent / "data" / "faers_flat_deduped.parquet"
+PARQUET_PATH = Path(__file__).resolve().parent / "data" / "faers_sorted.parquet"
 CONFIG_FILE  = Path(__file__).resolve().parent / "run_config.json"
 
 
@@ -90,21 +90,12 @@ def get_run_config() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_ct(config: dict) -> pd.DataFrame:
-    """
-    Costruisce la contingency table via DuckDB.
-    
-    Passa esplicitamente threads e memory_limit per evitare che DuckDB
-    usi i default conservativi del container (1 thread, 256MB).
-    Il Parquet viene letto una sola volta grazie alla view registrata
-    dentro build_contingency_table().
-    """
+    """Costruisce la contingency table via DuckDB. Il passo più pesante della pipeline."""
     return build_contingency_table(
         parquet_path=str(PARQUET_PATH),
         target_drug=config["target_drug"],
         min_a=config["min_a"],
         where_extra=config["where_extra"],
-        duckdb_threads=2,
-        duckdb_memory="1500MB",
     )
 
 

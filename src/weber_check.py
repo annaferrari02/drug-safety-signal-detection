@@ -32,7 +32,8 @@ Output (dict) restituito da check_weber_effect():
         "total_reports":         int,
         "early_phase_ratio":     float,      # % report nei primi 2 anni post-approval
         "quarterly_trend":       list[dict], # serie temporale per grafici dashboard
-        "trend_slope":           float,      # pendenza regressione lineare (report/quarter)
+        "trend_slope":           float,      # pendenza regressione su tutti i quarter
+        "post_peak_slope":       float,      # pendenza regressione dopo il picco (Weber-specifico)
         "peak_quarter_offset":   int | None, # quarter con più report (0 = primo quarter)
         "weber_risk":            "LOW" | "MODERATE" | "HIGH",
         "risk_reasons":          list[str],  # motivazioni leggibili per la dashboard
@@ -84,8 +85,8 @@ DRUGSFDA_URL = "https://api.fda.gov/drug/drugsfda.json"
 #       0-3 → picco nel primo anno: classico Weber
 #       4-7 → picco nel secondo anno: Weber moderato
 #
-#   trend_slope_normalized: pendenza della regressione dopo il picco
-#       fortemente negativa → declino rapido dopo il picco (Weber classico)
+#   post_peak_slope: pendenza della regressione DOPO il picco
+#       fortemente negativa → declino rapido (firma Weber classica)
 
 THRESHOLDS = {
     "early_ratio_high":     0.70,
@@ -111,6 +112,22 @@ def _save_approval_cache(cache: dict) -> None:
     APPROVAL_CACHE_PATH.write_text(
         json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+
+# ── Regressione lineare semplice (OLS) ──────────────────────────────────────
+
+def _linear_slope(xs: list, ys: list) -> Optional[float]:
+    """OLS slope of ys ~ xs. Returns None if fewer than 4 points or zero variance."""
+    n = len(xs)
+    if n < 4:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    den = sum((x - mean_x) ** 2 for x in xs)
+    if den == 0:
+        return None
+    return round(num / den, 4)
 
 
 # ── Fetch anno di approvazione FDA ──────────────────────────────────────────
@@ -209,12 +226,16 @@ def compute_weber_metrics(
     Calcola le metriche temporali di distribuzione dei report FAERS per il
     farmaco target, necessarie alla classificazione del rischio Weber.
 
-    Usa DuckDB direttamente sul Parquet senza caricare dati in pandas,
-    coerentemente con il resto della pipeline.
+    Usa DuckDB direttamente sul Parquet senza caricare dati in pandas.
+    Se disponibile, usa faers_sorted.parquet per il row group pruning su
+    drug_name (stessa ottimizzazione della contingency table).
+
+    Una singola query con CTE legge il Parquet una volta sola e restituisce
+    sia i totali aggregati sia la distribuzione per quarter.
 
     Parameters
     ----------
-    parquet_path  : path al Parquet deduplicato
+    parquet_path  : path al Parquet deduplicato (fallback se sorted non esiste)
     target_drug   : nome farmaco in uppercase
     approval_year : anno di approvazione FDA (None se non disponibile)
 
@@ -228,67 +249,91 @@ def compute_weber_metrics(
         quarterly_counts     : list[dict]  — { year, quarter, reports, quarter_offset }
         early_phase_ratio    : float | None
         peak_quarter_offset  : int | None
-        trend_slope          : float | None  — da regressione lineare semplice
+        peak_reports         : int | None  — report nel quarter di picco
+        trend_slope          : float | None  — slope su tutti i quarter
+        post_peak_slope      : float | None  — slope dopo il picco (Weber-specifico)
     """
+    # Fix A: faers_sorted.parquet ha row group pruning su drug_name
+    _sorted = Path(parquet_path).parent / "faers_sorted.parquet"
+    p = str(_sorted) if _sorted.exists() else parquet_path
+
+    # Fix B: configura DuckDB per query single-drug veloci
     con = duckdb.connect()
-    p   = parquet_path
+    con.execute("SET threads = 4")
+    con.execute("SET memory_limit = '2GB'")
+    con.execute("SET preserve_insertion_order = false")
 
-    # Totale report e span temporale per il farmaco
-    totals = con.execute(f"""
+    # Unica scansione del Parquet: CTE base → totali + distribuzione quarter
+    rows = con.execute(f"""
+        WITH drug_rows AS (
+            SELECT
+                safetyreportid,
+                receive_year,
+                receive_quarter,
+                CAST(receive_quarter[-1] AS INT) AS q
+            FROM '{p}'
+            WHERE drug_name = '{target_drug}'
+              AND receive_year IS NOT NULL
+        ),
+        totals AS (
+            SELECT
+                COUNT(DISTINCT safetyreportid) AS total_reports,
+                MIN(receive_year)              AS first_year,
+                MAX(receive_year)              AS last_year
+            FROM drug_rows
+        ),
+        quarterly AS (
+            SELECT
+                receive_year                   AS year,
+                q,
+                COUNT(DISTINCT safetyreportid) AS reports
+            FROM drug_rows
+            WHERE receive_quarter IS NOT NULL
+            GROUP BY receive_year, q
+        )
         SELECT
-            COUNT(DISTINCT safetyreportid)      AS total_reports,
-            MIN(receive_year)                   AS first_year,
-            MAX(receive_year)                   AS last_year
-        FROM '{p}'
-        WHERE drug_name = '{target_drug}'
-          AND receive_year IS NOT NULL
-    """).fetchone()
-
-    if totals is None or totals[0] == 0:
-        con.close()
-        return {
-            "total_reports":     0,
-            "years_in_dataset":  0,
-            "first_year":        None,
-            "last_year":         None,
-            "quarterly_counts":  [],
-            "early_phase_ratio": None,
-            "peak_quarter_offset": None,
-            "trend_slope":       None,
-        }
-
-    total_reports = int(totals[0])
-    first_year    = int(totals[1])
-    last_year     = int(totals[2])
-    years_in_dataset = last_year - first_year + 1
-
-    # Distribuzione per quarter (report unici per trimestre)
-    quarterly_raw = con.execute(f"""
-        SELECT
-            receive_year                        AS year,
-            CAST(receive_quarter[-1] AS INT)    AS q,
-            COUNT(DISTINCT safetyreportid)      AS reports
-        FROM '{p}'
-        WHERE drug_name = '{target_drug}'
-          AND receive_year IS NOT NULL
-          AND receive_quarter IS NOT NULL
-        GROUP BY receive_year, receive_quarter
-        ORDER BY receive_year, q
-    """).df()
+            t.total_reports,
+            t.first_year,
+            t.last_year,
+            qr.year,
+            qr.q,
+            qr.reports
+        FROM quarterly qr
+        CROSS JOIN totals t
+        ORDER BY qr.year, qr.q
+    """).fetchall()
 
     con.close()
 
-    # Calcola quarter_offset dalla data di approvazione
-    # Se approval_year non disponibile, usa first_year come riferimento
+    _empty = {
+        "total_reports":      0,
+        "years_in_dataset":   0,
+        "first_year":         None,
+        "last_year":          None,
+        "quarterly_counts":   [],
+        "early_phase_ratio":  None,
+        "peak_quarter_offset": None,
+        "peak_reports":       None,
+        "trend_slope":        None,
+        "post_peak_slope":    None,
+    }
+
+    if not rows or rows[0][0] == 0:
+        return _empty
+
+    total_reports    = int(rows[0][0])
+    first_year       = int(rows[0][1])
+    last_year        = int(rows[0][2])
+    years_in_dataset = last_year - first_year + 1
+
     ref_year = approval_year if approval_year is not None else first_year
 
     quarterly_counts = []
-    for _, row in quarterly_raw.iterrows():
-        year     = int(row["year"])
-        q        = int(row["q"])
-        reports  = int(row["reports"])
-        # Offset in quarter dalla prima quarter del ref_year
-        offset   = (year - ref_year) * 4 + (q - 1)
+    for row in rows:
+        year    = int(row[3])
+        q       = int(row[4])
+        reports = int(row[5])
+        offset  = (year - ref_year) * 4 + (q - 1)
         quarterly_counts.append({
             "year":           year,
             "quarter":        q,
@@ -297,35 +342,34 @@ def compute_weber_metrics(
             "quarter_offset": offset,
         })
 
-    # Early-phase ratio: report nei primi 2 anni post-approvazione
-    # (offset 0-7 = primi 8 quarter = 2 anni)
+    # Early-phase ratio: report nei primi 2 anni post-approvazione (offset 0-7)
     early_phase_ratio = None
     if approval_year is not None and total_reports > 0:
-        early_reports = sum(
-            e["reports"] for e in quarterly_counts
-            if 0 <= e["quarter_offset"] <= 7
-        )
+        early_reports     = sum(e["reports"] for e in quarterly_counts if 0 <= e["quarter_offset"] <= 7)
         early_phase_ratio = early_reports / total_reports
 
-    # Quarter con il picco di segnalazione
-    peak_quarter_offset = None
-    if quarterly_counts:
-        peak_entry = max(quarterly_counts, key=lambda x: x["reports"])
-        peak_quarter_offset = peak_entry["quarter_offset"]
+    # Quarter di picco
+    peak_entry          = max(quarterly_counts, key=lambda x: x["reports"]) if quarterly_counts else None
+    peak_quarter_offset = peak_entry["quarter_offset"] if peak_entry else None
+    peak_reports        = peak_entry["reports"]        if peak_entry else None
 
-    # Regressione lineare semplice: reports ~ quarter_offset
-    # per quantificare il trend complessivo (slope negativa = declino nel tempo)
-    trend_slope = None
-    if len(quarterly_counts) >= 4:
-        xs = [e["quarter_offset"] for e in quarterly_counts]
-        ys = [e["reports"]        for e in quarterly_counts]
-        n  = len(xs)
-        mean_x = sum(xs) / n
-        mean_y = sum(ys) / n
-        num    = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-        den    = sum((x - mean_x) ** 2 for x in xs)
-        if den > 0:
-            trend_slope = round(num / den, 4)
+    offsets = [e["quarter_offset"] for e in quarterly_counts]
+    counts  = [e["reports"]        for e in quarterly_counts]
+
+    # Slope globale su tutti i quarter
+    trend_slope = _linear_slope(offsets, counts)
+
+    # Post-peak slope: regressione sui quarter successivi al picco.
+    # Questo è il marker più specifico per il Weber effect: un declino
+    # ripido dopo il picco early-phase è la firma del bias classico.
+    post_peak_slope = None
+    if peak_quarter_offset is not None:
+        post_peak = [e for e in quarterly_counts if e["quarter_offset"] > peak_quarter_offset]
+        if len(post_peak) >= 3:
+            post_peak_slope = _linear_slope(
+                [e["quarter_offset"] for e in post_peak],
+                [e["reports"]        for e in post_peak],
+            )
 
     return {
         "total_reports":       total_reports,
@@ -335,7 +379,9 @@ def compute_weber_metrics(
         "quarterly_counts":    quarterly_counts,
         "early_phase_ratio":   early_phase_ratio,
         "peak_quarter_offset": peak_quarter_offset,
+        "peak_reports":        peak_reports,
         "trend_slope":         trend_slope,
+        "post_peak_slope":     post_peak_slope,
     }
 
 
@@ -356,7 +402,7 @@ def _classify_weber_risk(
         1. early_phase_ratio   — peso maggiore: misura diretta della concentrazione
         2. years_in_dataset    — dato troppo corto → incertezza intrinseca
         3. peak_quarter_offset — picco nel primo anno è il marker classico di Weber
-        4. approval_year None  — impossibile calcolare i ratio senza riferimento
+        4. post_peak_slope     — declino post-picco: conferma del pattern Weber
 
     Returns
     -------
@@ -370,6 +416,7 @@ def _classify_weber_risk(
     years_in_dataset    = metrics["years_in_dataset"]
     early_phase_ratio   = metrics["early_phase_ratio"]
     peak_quarter_offset = metrics["peak_quarter_offset"]
+    post_peak_slope     = metrics.get("post_peak_slope")
 
     # ── Criterio 0: dati insufficienti ───────────────────────────────────────
     if total_reports < T["min_reports"]:
@@ -448,8 +495,31 @@ def _classify_weber_risk(
             )
             scores.append("LOW")
 
+    # ── Criterio 4: declino post-picco (conferma Weber) ─────────────────────
+    # Valutato solo se il picco è nella finestra Weber (0-7 quarter) e abbiamo
+    # abbastanza dati post-picco per la regressione.
+    # Un post_peak_slope fortemente negativo è la firma del Weber classico:
+    # i report calano rapidamente dopo il picco early-phase.
+    if (post_peak_slope is not None
+            and peak_quarter_offset is not None
+            and approval_year is not None
+            and 0 <= peak_quarter_offset < T["peak_window_moderate"]):
+        if post_peak_slope < 0:
+            reasons.append(
+                f"Declino post-picco confermato (slope = {post_peak_slope:+.2f} report/quarter): "
+                "la curva di segnalazione segue il pattern classico del Weber effect"
+            )
+            scores.append("HIGH")
+        else:
+            reasons.append(
+                f"Trend post-picco stabile o crescente (slope = {post_peak_slope:+.2f} report/quarter): "
+                "la curva non mostra il declino atteso dopo un picco early-phase"
+            )
+            # Nota informativa: non aggiungiamo LOW perché gli altri criteri
+            # potrebbero già indicare HIGH; non vogliamo mitigare ingiustamente.
+
     # ── Livello finale: il più alto tra tutti i criteri ──────────────────────
-    priority = {"HIGH": 2, "MODERATE": 1, "LOW": 0}
+    priority   = {"HIGH": 2, "MODERATE": 1, "LOW": 0}
     final_risk = max(scores, key=lambda s: priority[s]) if scores else "LOW"
 
     return final_risk, reasons
@@ -458,20 +528,20 @@ def _classify_weber_risk(
 def _build_warning_message(risk: str, drug_name: str) -> str:
     messages = {
         "HIGH": (
-            f"⚠️  ATTENZIONE — Rischio Weber effect ALTO per {drug_name}. "
+            f"ATTENZIONE — Rischio Weber effect ALTO per {drug_name}. "
             "I segnali rilevati potrebbero essere sovrastimati a causa di una "
             "sovra-segnalazione nelle fasi iniziali post-approvazione. "
             "Interpretare i risultati con estrema cautela e confrontarli con "
             "letteratura clinica indipendente."
         ),
         "MODERATE": (
-            f"⚡ CAUTELA — Rischio Weber effect MODERATO per {drug_name}. "
+            f"CAUTELA — Rischio Weber effect MODERATO per {drug_name}. "
             "La distribuzione temporale dei report presenta alcune caratteristiche "
             "compatibili con il Weber effect. I segnali potrebbero essere "
             "parzialmente influenzati da bias di segnalazione early-phase."
         ),
         "LOW": (
-            f"✅ Rischio Weber effect BASSO per {drug_name}. "
+            f"Rischio Weber effect BASSO per {drug_name}. "
             "La distribuzione temporale dei report appare stabile. "
             "I segnali rilevati non mostrano evidenti distorsioni legate "
             "alla sovra-segnalazione post-approvazione."
@@ -518,7 +588,7 @@ def check_weber_effect(
     mem_cache  = {k: v for k, v in disk_cache.items()}
 
     if approval_year_override is not None:
-        approval_year  = approval_year_override
+        approval_year   = approval_year_override
         approval_source = "manual"
         print(f"  [CONFIG] Anno di approvazione override: {approval_year}")
     else:
@@ -547,10 +617,11 @@ def check_weber_effect(
             "early_phase_ratio":   None,
             "quarterly_trend":     [],
             "trend_slope":         None,
+            "post_peak_slope":     None,
             "peak_quarter_offset": None,
             "weber_risk":          "HIGH",
             "risk_reasons":        ["Nessun report trovato nel dataset per questo farmaco."],
-            "warning_message":     f"⚠️  Nessun dato disponibile per {drug_name} nel dataset.",
+            "warning_message":     f"Nessun dato disponibile per {drug_name} nel dataset.",
             "check_timestamp":     datetime.now().isoformat(),
         }
 
@@ -576,8 +647,9 @@ def check_weber_effect(
             round(metrics["early_phase_ratio"], 4)
             if metrics["early_phase_ratio"] is not None else None
         ),
-        "quarterly_trend":     metrics["quarterly_counts"],  # lista completa per grafici
+        "quarterly_trend":     metrics["quarterly_counts"],
         "trend_slope":         metrics["trend_slope"],
+        "post_peak_slope":     metrics["post_peak_slope"],
         "peak_quarter_offset": metrics["peak_quarter_offset"],
         "weber_risk":          weber_risk,
         "risk_reasons":        risk_reasons,
@@ -599,7 +671,6 @@ def weber_summary(result: dict) -> None:
         print("  [WARN] Nessun risultato Weber check disponibile.")
         return
 
-
     print(f"\n  Farmaco         : {result['drug']}")
     print(f"  Approvazione FDA: {result['approval_year'] or 'non disponibile'} "
           f"({result['approval_source']})")
@@ -609,6 +680,8 @@ def weber_summary(result: dict) -> None:
     if result["early_phase_ratio"] is not None:
         print(f"  Early-phase ratio: {result['early_phase_ratio']:.1%} "
               f"(primi 2 anni post-approvazione)")
+    if result["post_peak_slope"] is not None:
+        print(f"  Post-peak slope : {result['post_peak_slope']:+.2f} report/quarter")
     print(f"\n  Weber risk: {result['weber_risk']}")
     for reason in result["risk_reasons"]:
         print(f"    • {reason}")
@@ -621,7 +694,9 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-    PARQUET = str(Path(__file__).resolve().parent.parent / "data" / "faers_flat_deduped.parquet")
+    _data = Path(__file__).resolve().parent.parent / "data"
+    _sorted = _data / "faers_sorted.parquet"
+    PARQUET = str(_sorted) if _sorted.exists() else str(_data / "faers_flat_deduped.parquet")
     DRUG    = sys.argv[1].upper() if len(sys.argv) > 1 else "LAPATINIB"
 
     result = check_weber_effect(
@@ -630,7 +705,6 @@ if __name__ == "__main__":
     )
     weber_summary(result)
 
-    # Salva il risultato per ispezione
-    out = Path(__file__).resolve().parent.parent / "data" / f"weber_{DRUG.lower()}.json"
+    out = _data / f"weber_{DRUG.lower()}.json"
     out.write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     print(f"\nSalvato: {out}")
