@@ -33,3 +33,9 @@ notebooks/data/
 .env
 *.env
 config/secrets.py
+
+# Ignora tutti i file Parquet in qualsiasi cartella
+*.parquet
+
+# Ignora tutti i file JSON in qualsiasi cartella
+*.json
