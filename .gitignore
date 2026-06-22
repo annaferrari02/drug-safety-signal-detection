@@ -39,3 +39,5 @@ config/secrets.py
 
 # Ignora tutti i file JSON in qualsiasi cartella
 *.json
+
+data/duckdb_tmp/
