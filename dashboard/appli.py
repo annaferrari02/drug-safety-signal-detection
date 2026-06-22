@@ -392,31 +392,50 @@ def count_unknown_age_excluded() -> int | None:
 # CONFIDENCE SCORE — ranking degli AE
 # ============================================================================
 
-def compute_confidence_score(validated_df: pd.DataFrame, algo_results: dict) -> pd.DataFrame:
+def compute_confidence_score(
+        validated_df: pd.DataFrame,
+        algo_results: dict,
+        ct: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
     Calcola un confidence score composito per ogni AE rilevato come segnale positivo
     da almeno un algoritmo.
 
-    Logica:
-        1. Conteggio algoritmi concordanti  (0–4) — peso 40%
+    Logica (pesi aggiornati):
+        1. Concordanza algoritmi  (0-4) — peso 30%
            Quanti dei 4 algoritmi classificano l'AE come signal_positive?
 
-        2. Forza del segnale normalizzata    (0–1) — peso 60%
+        2. Forza del segnale normalizzata (0-1) — peso 40%
            Media delle metriche principali normalizzate:
-               PRR  → log(PRR) / log(PRR_max)
-               ROR  → log(ROR) / log(ROR_max)
-               BCPNN → IC / IC_max
-               MGPS  → EBGM / EBGM_max   (o EB05)
+               PRR  -> log(PRR) / log(PRR_max)
+               ROR  -> log(ROR) / log(ROR_max)
+               BCPNN -> IC / IC_max
+               MGPS  -> EBGM / EBGM_max (o EB05)
 
-    Score finale: 0–100, arrotondato a 1 decimale.
+        3. Reporting rate normalizzato (0-1) — peso 30%
+           a / (a + b) = frequenza assoluta dell'AE nei report del farmaco target,
+           normalizzata sul massimo osservato tra tutti gli AE.
+           Permette agli AE comuni (vomito, cefalea...) di emergere anche quando
+           il segnale relativo e' basso per via del masking da background comune.
+           Fonte: contingency table (colonne a, b).
+
+    Score finale: 0-100, arrotondato a 1 decimale.
 
     Returns
     -------
     DataFrame con colonne: ae_name, confidence_score, n_algorithms,
-                           algorithms_positive, validation_status, weber_risk
+                           algorithms_positive, validation_status, reporting_rate
     """
     if validated_df is None or len(validated_df) == 0:
         return pd.DataFrame()
+
+    # Indice reporting rate dalla CT: ae_name -> a / (a+b)
+    rr_index: dict[str, float] = {}
+    if ct is not None and not ct.empty and {"pt", "a", "b"}.issubset(ct.columns):
+        ct_rr = ct.copy()
+        denom = (ct_rr["a"] + ct_rr["b"]).replace(0, np.nan)
+        ct_rr["reporting_rate"] = ct_rr["a"] / denom
+        rr_index = ct_rr.set_index("pt")["reporting_rate"].to_dict()
 
     # Raccogli tutti gli AE con almeno un segnale positivo
     ae_set = set(validated_df["ae_name"].unique())
@@ -466,17 +485,19 @@ def compute_confidence_score(validated_df: pd.DataFrame, algo_results: dict) -> 
 
         n_algos = len(algos_positive)
         avg_strength = np.mean(signal_strengths) if signal_strengths else 0.0
+        reporting_rate = rr_index.get(ae, 0.0) or 0.0
 
         # Validazione label
         val_row = validated_df[validated_df["ae_name"] == ae]
         val_status = val_row.iloc[0].get("validation_status", "") if not val_row.empty else ""
 
         rows.append({
-            "ae_name":            ae,
-            "n_algorithms":       n_algos,
+            "ae_name":             ae,
+            "n_algorithms":        n_algos,
             "algorithms_positive": algos_positive,
-            "avg_strength":       avg_strength,
-            "validation_status":  val_status,
+            "avg_strength":        avg_strength,
+            "reporting_rate":      reporting_rate,
+            "validation_status":   val_status,
         })
 
     if not rows:
@@ -484,17 +505,19 @@ def compute_confidence_score(validated_df: pd.DataFrame, algo_results: dict) -> 
 
     result = pd.DataFrame(rows)
 
-    # Normalizza avg_strength su 0–1
+    # Normalizza avg_strength su 0-1
     max_strength = result["avg_strength"].max()
-    if max_strength > 0:
-        result["strength_norm"] = result["avg_strength"] / max_strength
-    else:
-        result["strength_norm"] = 0.0
+    result["strength_norm"] = result["avg_strength"] / max_strength if max_strength > 0 else 0.0
 
-    # Score composito: 40% concordanza algoritmi + 60% forza segnale
+    # Normalizza reporting_rate su 0-1
+    max_rr = result["reporting_rate"].max()
+    result["rr_norm"] = result["reporting_rate"] / max_rr if max_rr > 0 else 0.0
+
+    # Score composito: 30% concordanza + 40% forza segnale + 30% reporting rate
     result["confidence_score"] = (
-        0.40 * (result["n_algorithms"] / 4.0) +
-        0.60 * result["strength_norm"]
+        0.30 * (result["n_algorithms"] / 4.0) +
+        0.40 * result["strength_norm"] +
+        0.30 * result["rr_norm"]
     ) * 100
 
     result["confidence_score"] = result["confidence_score"].round(1)
@@ -732,7 +755,7 @@ def run_and_display(
     # ── Segnali AE ordinati per confidence ────────────────────────────────
     st.markdown('<div class="section-header">Adverse Events rilevati</div>', unsafe_allow_html=True)
 
-    ranked = compute_confidence_score(validated, algo_results)
+    ranked = compute_confidence_score(validated, algo_results, ct=ct)
 
     if not ranked.empty:
         render_ae_list(ranked, weber_risk=weber_risk, limit=ae_limit)
