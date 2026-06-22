@@ -1,288 +1,778 @@
+"""
+dashboard/appli.py
+
+Pipeline di disproportionality analysis su dati FAERS.
+
+Flusso risoluzione nome farmaco:
+    1. rapidfuzz — match fuzzy contro i drug_name nel Parquet
+    2. fallback Mistral AI — se score < soglia, chiede il principio attivo in inglese
+
+Age input: l'utente scrive l'età in anni → automaticamente mappata a age_stratum.
+
+Ranking AE: ordinato per "confidence score" composito calcolato sui 4 algoritmi.
+Icone per ogni AE:
+    ✅ tick verde  — evento già validato da openFDA (KNOWN)
+    ⚠️ triangolo   — Weber effect risk (verde/arancione/rosso)
+"""
+
+import os
+import json
+import time
+import duckdb
 import streamlit as st
 import pandas as pd
+import numpy as np
 from pathlib import Path
 
-from run_signals import run_pipeline  # copiato in /app dal Dockerfile, vedi note
+# ---------------------------------------------------------------------------
+# Import pipeline — run_signals.py viene copiato in /app dal Dockerfile
+# ---------------------------------------------------------------------------
+from run_signals import run_pipeline
 
-st.set_page_config(page_title="Drug Safety Signal Detection", layout="wide")
+# ---------------------------------------------------------------------------
+# Configurazione pagina
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Drug Safety Signal Detection",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-st.title("Drug Safety Signal Detection")
-st.markdown("Configura i parametri e avvia la pipeline di disproportionality analysis sui dati FAERS.")
+# ---------------------------------------------------------------------------
+# CSS personalizzato — palette clinica, pulita
+# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+    /* Palette */
+    :root {
+        --bg: #F7F9FC;
+        --card: #FFFFFF;
+        --border: #E2E8F0;
+        --text: #1A202C;
+        --muted: #718096;
+        --accent: #2B6CB0;
+        --accent-light: #EBF4FF;
+        --green: #276749;
+        --green-bg: #F0FFF4;
+        --orange: #C05621;
+        --orange-bg: #FFFAF0;
+        --red: #9B2335;
+        --red-bg: #FFF5F5;
+    }
+
+    .stApp { background: var(--bg); }
+
+    /* Card generica */
+    .signal-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px 18px;
+        margin-bottom: 10px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+    }
+
+    /* Rank badge */
+    .rank-badge {
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--muted);
+        min-width: 28px;
+        text-align: center;
+    }
+
+    /* Nome AE */
+    .ae-name {
+        flex: 1;
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text);
+    }
+
+    /* Confidence bar */
+    .conf-bar-wrap {
+        width: 120px;
+    }
+    .conf-bar-bg {
+        background: var(--border);
+        border-radius: 4px;
+        height: 6px;
+        width: 100%;
+    }
+    .conf-bar-fill {
+        height: 6px;
+        border-radius: 4px;
+        background: var(--accent);
+    }
+    .conf-label {
+        font-size: 10px;
+        color: var(--muted);
+        margin-top: 2px;
+        text-align: right;
+    }
+
+    /* Icone */
+    .icon-btn {
+        font-size: 18px;
+        cursor: pointer;
+        text-decoration: none;
+    }
+
+    /* Pill algoritmi */
+    .algo-pill {
+        display: inline-block;
+        font-size: 10px;
+        font-weight: 600;
+        padding: 2px 7px;
+        border-radius: 999px;
+        background: var(--accent-light);
+        color: var(--accent);
+        margin-right: 3px;
+    }
+
+    /* Header sezione */
+    .section-header {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin: 24px 0 10px 0;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 6px;
+    }
+
+    /* Tooltip box */
+    .tooltip-known {
+        background: var(--green-bg);
+        border: 1px solid #C6F6D5;
+        border-radius: 8px;
+        padding: 10px 14px;
+        font-size: 13px;
+        color: var(--green);
+        margin-bottom: 8px;
+    }
+    .tooltip-weber-low    { background: var(--green-bg);  border: 1px solid #C6F6D5; border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--green);  margin-bottom: 8px; }
+    .tooltip-weber-medium { background: var(--orange-bg); border: 1px solid #FEEBC8; border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--orange); margin-bottom: 8px; }
+    .tooltip-weber-high   { background: var(--red-bg);    border: 1px solid #FED7D7; border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--red);    margin-bottom: 8px; }
+
+    /* Drug match chip */
+    .match-chip {
+        display: inline-block;
+        background: #EBF4FF;
+        color: #2B6CB0;
+        font-size: 12px;
+        padding: 3px 10px;
+        border-radius: 999px;
+        margin-bottom: 6px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
-# Path del parquet con tutti i segnali storici/aggregati, scritto da
-# run_pipeline() stessa (vedi SIGNALS_OUT in run_signals.py) ad ogni run.
-# Risolve a /app/data/signals_full.parquet nel container, coerente con
-# il volume ./data:/app/data del docker-compose.
+# Percorsi
 # ---------------------------------------------------------------------------
-SIGNALS_FULL_PATH = Path(__file__).resolve().parent / "data" / "signals_full.parquet"
-
+DATA_DIR               = Path(__file__).resolve().parent / "data"
+PARQUET_PATH           = DATA_DIR / "faers_flat_deduped.parquet"
+SIGNALS_FULL_PATH      = DATA_DIR / "signals_full.parquet"
+DRUG_INDEX_CACHE_PATH  = DATA_DIR / "drug_index_cache.json"
 
 # ---------------------------------------------------------------------------
-# Default per i parametri avanzati
+# Costanti UI
 # ---------------------------------------------------------------------------
-DEFAULT_ALGORITHMS = ["prr", "ror", "bcpnn", "mgps"]
-DEFAULT_MIN_A = 3
-DEFAULT_FDR_THRESHOLD = 0.05
-DEFAULT_EB05_THRESHOLD = 2.0
-DEFAULT_IC_THRESHOLD = 0.0
+DEFAULT_ALGORITHMS  = ["prr", "ror", "bcpnn", "mgps"]
+DEFAULT_MIN_A       = 3
+DEFAULT_FDR         = 0.05
+DEFAULT_EB05        = 2.0
+DEFAULT_IC          = 0.0
 
-# Liste statiche di suggerimento per i blocchi DRUG e CO-MEDICATION.
-# TODO: personalizza con i farmaci piu rilevanti per il tuo caso d'uso.
 SUGGESTED_DRUGS = [
-    "LAPATINIB",
-    "CAPECITABINE",
-    "TRASTUZUMAB",
-    "PACLITAXEL",
-    "DOCETAXEL",
-    "TAMOXIFEN",
-    "LETROZOLE",
-    "CISPLATIN",
-    "DOXORUBICIN",
-    "METFORMIN",
+    "LAPATINIB","CAPECITABINE","TRASTUZUMAB","PACLITAXEL","DOCETAXEL",
+    "TAMOXIFEN","LETROZOLE","CISPLATIN","DOXORUBICIN","METFORMIN",
 ]
-
 SEX_OPTIONS = ["All", "Female", "Male"]
-AGE_OPTIONS = ["All", "Pediatric", "Adult", "Geriatric"]
 
 
-# ---------------------------------------------------------------------------
-# Helper: costruisce where_extra a partire dai 4 blocchi UI.
-# NB: la subquery di co-medication referenzia faers_flat_deduped.parquet,
-# cioe PARQUET_PATH dentro run_signals.py. Qui usiamo lo stesso path
-# assoluto che risolve run_signals.py nel container (/app/data/...).
-# ---------------------------------------------------------------------------
-COMEDICATION_PARQUET_PATH = Path(__file__).resolve().parent / "data" / "faers_flat_deduped.parquet"
+# ============================================================================
+# UTILITÀ: indice farmaci dal Parquet
+# ============================================================================
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_drug_index() -> list[str]:
+    """Carica tutti i drug_name distinti dal Parquet (con cache Streamlit 1h)."""
+    if not PARQUET_PATH.exists():
+        return SUGGESTED_DRUGS
+    try:
+        con = duckdb.connect()
+        result = con.execute(
+            f"SELECT DISTINCT drug_name FROM '{PARQUET_PATH}' WHERE drug_name IS NOT NULL"
+        ).fetchall()
+        return [r[0] for r in result if r[0]]
+    except Exception:
+        return SUGGESTED_DRUGS
 
 
-def build_where_extra(sex: str, age_stratum: str, comedication: str) -> str | None:
+# ============================================================================
+# RISOLUZIONE NOME FARMACO: rapidfuzz → fallback Mistral
+# ============================================================================
+
+def resolve_drug_name(user_input: str, drug_index: list[str], mistral_key: str | None = None) -> tuple[str, str, float]:
+    """
+    Risolve il nome farmaco inserito dall'utente al drug_name nel Parquet.
+
+    Returns
+    -------
+    (resolved_name, method, score)
+        method: "exact" | "fuzzy" | "mistral" | "passthrough"
+        score: 0–100 (confidenza del match fuzzy; 100 per exact/mistral)
+    """
+    from rapidfuzz import process, fuzz
+
+    query = user_input.strip().upper()
+
+    # 1. Match esatto
+    if query in drug_index:
+        return query, "exact", 100.0
+
+    # 2. rapidfuzz — token_set_ratio gestisce sinonimi parziali meglio di ratio semplice
+    result = process.extractOne(query, drug_index, scorer=fuzz.token_set_ratio)
+    if result:
+        match, score, _ = result
+        if score >= 75:
+            return match, "fuzzy", float(score)
+
+    # 3. Fallback Mistral — mappa direttamente su drug_index (nomi reali del Parquet).
+    #    La lista passata è quella dei nomi che esistono davvero nel dataset,
+    #    NON principi_attivi.json — che contiene nomi italiani/brand non presenti nel Parquet.
+    if mistral_key:
+        try:
+            from src.text_to_sql import resolve_drug_name_mistral
+            inn = resolve_drug_name_mistral(
+                user_input,
+                drug_list=drug_index,   # ← nomi reali del Parquet
+                api_key=mistral_key,
+            )
+            if inn:
+                return inn, "mistral", 100.0
+        except Exception:
+            pass
+
+    # 4. Passthrough — nessun match affidabile, passa la query grezza
+    return query, "passthrough", 0.0
+
+
+def resolve_comedication(user_input: str, drug_index: list[str], mistral_key: str | None = None) -> tuple[str, str, float]:
+    """Stesso flow di resolve_drug_name per la co-medicazione."""
+    return resolve_drug_name(user_input, drug_index, mistral_key)
+
+
+# ============================================================================
+# MAPPING ETÀ → AGE STRATUM
+# ============================================================================
+
+def age_to_stratum(age_input: str) -> str | None:
+    """
+    Converte un input testuale età in age_stratum.
+    Accetta: numero intero (anni), oppure testo libero ("adult", "pediatric", ...).
+    """
+    if not age_input or age_input.strip() == "":
+        return None
+
+    s = age_input.strip().lower()
+
+    # Testo diretto
+    mapping = {
+        "pediatric": "pediatric", "child": "pediatric", "children": "pediatric",
+        "infant": "pediatric", "neonatal": "pediatric", "bambino": "pediatric",
+        "adult": "adult", "adulto": "adult",
+        "geriatric": "geriatric", "elderly": "geriatric", "anziano": "geriatric",
+        "all": None, "tutti": None, "": None,
+    }
+    if s in mapping:
+        return mapping[s]
+
+    # Numero di anni
+    try:
+        age = int(s)
+        if age < 18:
+            return "pediatric"
+        elif age < 65:
+            return "adult"
+        else:
+            return "geriatric"
+    except ValueError:
+        return None
+
+
+# ============================================================================
+# COSTRUZIONE WHERE EXTRA
+# ============================================================================
+
+def build_where_extra(sex: str, age_stratum: str | None, comedication_resolved: str | None) -> str | None:
     clauses = []
 
-    if sex and sex != "Tutti":
+    if sex and sex.lower() not in ("all", "tutti", ""):
         clauses.append(f"sex = '{sex.strip().lower()}'")
 
-    if age_stratum and age_stratum != "Tutti":
-        clauses.append(f"age_stratum = '{age_stratum.strip().lower()}'")
+    if age_stratum:
+        clauses.append(f"age_stratum = '{age_stratum}'")
 
-    if comedication and comedication.strip():
-        comed = comedication.strip().upper()
+    if comedication_resolved:
         clauses.append(
             f"""safetyreportid IN (
                 SELECT DISTINCT safetyreportid
-                FROM '{COMEDICATION_PARQUET_PATH}'
-                WHERE drug_name = '{comed}'
+                FROM '{PARQUET_PATH}'
+                WHERE drug_name = '{comedication_resolved}'
             )"""
         )
 
-    if not clauses:
-        return None
-    return " AND ".join(clauses)
+    return " AND ".join(clauses) if clauses else None
 
 
-def count_unknown_age_excluded(age_stratum: str) -> int | None:
-    """
-    Se e stato applicato un filtro su age_stratum (diverso da 'Tutti' / vuoto),
-    conta quanti report con safetyreportid distinto hanno age_stratum = 'unknown'
-    nell'intero dataset.
-    """
-    if not age_stratum or age_stratum == "Tutti":
-        return None
-
-    import duckdb
-    query = f"""
-        SELECT COUNT(DISTINCT safetyreportid)
-        FROM '{COMEDICATION_PARQUET_PATH}'
-        WHERE age_stratum = 'unknown'
-    """
+def count_unknown_age_excluded() -> int | None:
     try:
         con = duckdb.connect()
-        result = con.execute(query).fetchone()
+        result = con.execute(
+            f"SELECT COUNT(DISTINCT safetyreportid) FROM '{PARQUET_PATH}' WHERE age_stratum = 'unknown'"
+        ).fetchone()
         return result[0] if result else None
     except Exception:
         return None
 
 
+# ============================================================================
+# CONFIDENCE SCORE — ranking degli AE
+# ============================================================================
+
+def compute_confidence_score(validated_df: pd.DataFrame, algo_results: dict) -> pd.DataFrame:
+    """
+    Calcola un confidence score composito per ogni AE rilevato come segnale positivo
+    da almeno un algoritmo.
+
+    Logica:
+        1. Conteggio algoritmi concordanti  (0–4) — peso 40%
+           Quanti dei 4 algoritmi classificano l'AE come signal_positive?
+
+        2. Forza del segnale normalizzata    (0–1) — peso 60%
+           Media delle metriche principali normalizzate:
+               PRR  → log(PRR) / log(PRR_max)
+               ROR  → log(ROR) / log(ROR_max)
+               BCPNN → IC / IC_max
+               MGPS  → EBGM / EBGM_max   (o EB05)
+
+    Score finale: 0–100, arrotondato a 1 decimale.
+
+    Returns
+    -------
+    DataFrame con colonne: ae_name, confidence_score, n_algorithms,
+                           algorithms_positive, validation_status, weber_risk
+    """
+    if validated_df is None or len(validated_df) == 0:
+        return pd.DataFrame()
+
+    # Raccogli tutti gli AE con almeno un segnale positivo
+    ae_set = set(validated_df["ae_name"].unique())
+
+    rows = []
+    for ae in ae_set:
+        algos_positive = []
+        signal_strengths = []
+
+        # PRR
+        if "prr" in algo_results and algo_results["prr"] is not None:
+            df_prr = algo_results["prr"]
+            row = df_prr[df_prr["ae_name"] == ae]
+            if not row.empty and row.iloc[0].get("signal_positive", False):
+                algos_positive.append("PRR")
+                prr_val = row.iloc[0].get("PRR", 1)
+                if prr_val > 0:
+                    signal_strengths.append(np.log(max(prr_val, 1)))
+
+        # ROR
+        if "ror" in algo_results and algo_results["ror"] is not None:
+            df_ror = algo_results["ror"]
+            row = df_ror[df_ror["ae_name"] == ae]
+            if not row.empty and row.iloc[0].get("signal_positive", False):
+                algos_positive.append("ROR")
+                ror_val = row.iloc[0].get("ROR", 1)
+                if ror_val > 0:
+                    signal_strengths.append(np.log(max(ror_val, 1)))
+
+        # BCPNN
+        if "bcpnn" in algo_results and algo_results["bcpnn"] is not None:
+            df_bc = algo_results["bcpnn"]
+            row = df_bc[df_bc["ae_name"] == ae]
+            if not row.empty and row.iloc[0].get("signal_positive", False):
+                algos_positive.append("BCPNN")
+                ic_val = row.iloc[0].get("IC", 0)
+                signal_strengths.append(max(ic_val, 0))
+
+        # MGPS
+        if "mgps" in algo_results and algo_results["mgps"] is not None:
+            df_mg = algo_results["mgps"]
+            row = df_mg[df_mg["ae_name"] == ae]
+            if not row.empty and row.iloc[0].get("signal_positive", False):
+                algos_positive.append("MGPS")
+                eb_val = row.iloc[0].get("EBGM", row.iloc[0].get("EB05", 0))
+                signal_strengths.append(np.log(max(eb_val, 1)))
+
+        n_algos = len(algos_positive)
+        avg_strength = np.mean(signal_strengths) if signal_strengths else 0.0
+
+        # Validazione label
+        val_row = validated_df[validated_df["ae_name"] == ae]
+        val_status = val_row.iloc[0].get("validation_status", "") if not val_row.empty else ""
+
+        rows.append({
+            "ae_name":            ae,
+            "n_algorithms":       n_algos,
+            "algorithms_positive": algos_positive,
+            "avg_strength":       avg_strength,
+            "validation_status":  val_status,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+
+    # Normalizza avg_strength su 0–1
+    max_strength = result["avg_strength"].max()
+    if max_strength > 0:
+        result["strength_norm"] = result["avg_strength"] / max_strength
+    else:
+        result["strength_norm"] = 0.0
+
+    # Score composito: 40% concordanza algoritmi + 60% forza segnale
+    result["confidence_score"] = (
+        0.40 * (result["n_algorithms"] / 4.0) +
+        0.60 * result["strength_norm"]
+    ) * 100
+
+    result["confidence_score"] = result["confidence_score"].round(1)
+
+    return result.sort_values("confidence_score", ascending=False).reset_index(drop=True)
+
+
+# ============================================================================
+# RENDERING LISTA AE CON ICONE
+# ============================================================================
+
+WEBER_COLORS = {
+    "LOW":    ("🟢", "tooltip-weber-low",    "Bias minimo"),
+    "MEDIUM": ("🟠", "tooltip-weber-medium", "Bias moderato"),
+    "HIGH":   ("🔴", "tooltip-weber-high",   "Bias elevato"),
+}
+
+def render_ae_list(ranked_df: pd.DataFrame, weber_risk: str | None, limit: int | None = None):
+    """
+    Renderizza la lista ordinata degli AE con confidence bar e icone interattive.
+    """
+    if ranked_df.empty:
+        st.info("Nessun segnale rilevato con i parametri correnti.")
+        return
+
+    display_df = ranked_df if limit is None else ranked_df.head(limit)
+
+    # Determina icone Weber globali (rischio uguale per tutti gli AE della stessa run)
+    weber_emoji, weber_css, weber_label = WEBER_COLORS.get(
+        (weber_risk or "").upper(), ("⬜", "tooltip-weber-low", "N/D")
+    )
+
+    for i, row in display_df.iterrows():
+        ae      = row["ae_name"]
+        score   = row["confidence_score"]
+        n_algo  = row["n_algorithms"]
+        algos   = row.get("algorithms_positive", [])
+        val_st  = row.get("validation_status", "")
+        is_known = val_st == "KNOWN"
+
+        # Pill algoritmi
+        pills_html = "".join(f'<span class="algo-pill">{a}</span>' for a in algos)
+
+        # Confidence bar
+        bar_color = "#2B6CB0" if score >= 60 else ("#C05621" if score >= 35 else "#9B2335")
+        bar_html = f"""
+        <div class="conf-bar-wrap">
+            <div class="conf-bar-bg">
+                <div class="conf-bar-fill" style="width:{score}%;background:{bar_color};"></div>
+            </div>
+            <div class="conf-label">{score}/100</div>
+        </div>"""
+
+        # Icona validazione FDA
+        fda_icon = "✅" if is_known else ""
+
+        # Card HTML
+        card_html = f"""
+        <div class="signal-card">
+            <div class="rank-badge">#{i+1}</div>
+            <div style="flex:1">
+                <div class="ae-name">{ae}</div>
+                <div style="margin-top:4px">{pills_html}</div>
+            </div>
+            {bar_html}
+            <div style="font-size:20px;min-width:30px;text-align:center">{fda_icon}</div>
+            <div style="font-size:20px;min-width:30px;text-align:center">{weber_emoji}</div>
+        </div>"""
+
+        st.markdown(card_html, unsafe_allow_html=True)
+
+        # Expander per i dettagli delle icone
+        with st.expander("", expanded=False):
+            col_fda, col_weber = st.columns(2)
+
+            with col_fda:
+                if is_known:
+                    st.markdown(f"""
+                    <div class="tooltip-known">
+                        <strong>✅ Evento avverso scientificamente validato</strong><br>
+                        Questo evento avverso è riportato nel bugiardino ufficiale FDA
+                        per questo farmaco. La sua associazione è riconosciuta dalla
+                        letteratura regolatoria e confermata da studi clinici.
+                    </div>""", unsafe_allow_html=True)
+                elif val_st == "POTENTIALLY_NEW":
+                    st.markdown("""
+                    <div style="background:#FFFFF0;border:1px solid #FAF089;border-radius:8px;
+                                padding:10px 14px;font-size:13px;color:#744210;margin-bottom:8px">
+                        <strong>🔍 Segnale potenzialmente nuovo</strong><br>
+                        Questo evento avverso <em>non</em> compare nel bugiardino FDA.
+                        Il segnale è rilevato statisticamente ma non ha ancora
+                        una base scientifica consolidata nella letteratura regolatoria.
+                        Richiede ulteriore indagine clinica.
+                    </div>""", unsafe_allow_html=True)
+                else:
+                    st.caption("Validazione FDA non disponibile per questo AE.")
+
+            with col_weber:
+                if weber_risk:
+                    weber_text = {
+                        "LOW":    "Il rischio di Weber effect è basso. I report sono distribuiti "
+                                  "uniformemente nel tempo, senza picchi nelle fasi iniziali "
+                                  "post-approvazione. Il segnale è statisticamente affidabile.",
+                        "MEDIUM": "Rischio moderato di Weber effect. È presente una concentrazione "
+                                  "di report nelle fasi iniziali post-approvazione che potrebbe "
+                                  "sovrastimare il segnale. Interpretare con cautela.",
+                        "HIGH":   "⚠️ Rischio elevato di Weber effect. I report si concentrano "
+                                  "fortemente nei primi anni post-approvazione, il che suggerisce "
+                                  "un bias significativo. Il segnale potrebbe riflettere un effetto "
+                                  "di notorietà iniziale piuttosto che un rischio reale.",
+                    }.get((weber_risk or "").upper(), "Dati Weber non disponibili.")
+
+                    st.markdown(f"""
+                    <div class="{weber_css}">
+                        <strong>{weber_emoji} Weber effect — {weber_label}</strong><br>
+                        {weber_text}
+                    </div>""", unsafe_allow_html=True)
+                else:
+                    st.caption("Weber check non eseguito.")
+
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
 def build_config_from_ui(
-    target_drug: str,
-    where_extra: str | None,
-    min_a: int,
-    algorithms: list,
-    fdr_threshold: float,
-    eb05_threshold: float,
-    ic_threshold: float,
-    openfda_api_key: str | None,
-    validate_label: bool,
-    check_weber: bool,
-    weber_approval_override: int | None,
+    target_drug, where_extra, min_a, algorithms,
+    fdr_threshold, eb05_threshold, ic_threshold,
+    openfda_api_key, validate_label, check_weber, weber_approval_override,
 ) -> dict:
     return {
-        "target_drug": target_drug.strip().upper(),
-        "where_extra": where_extra,
-        "min_a": min_a,
-        "algorithms": algorithms,
-        "fdr_threshold": fdr_threshold,
-        "eb05_threshold": eb05_threshold,
-        "ic_threshold": ic_threshold,
-        "openfda_api_key": openfda_api_key or None,
-        "validate_label": validate_label,
-        "check_weber": check_weber,
+        "target_drug":             target_drug.strip().upper(),
+        "where_extra":             where_extra,
+        "min_a":                   min_a,
+        "algorithms":              algorithms,
+        "fdr_threshold":           fdr_threshold,
+        "eb05_threshold":          eb05_threshold,
+        "ic_threshold":            ic_threshold,
+        "openfda_api_key":         openfda_api_key or None,
+        "validate_label":          validate_label,
+        "check_weber":             check_weber,
         "weber_approval_override": weber_approval_override,
     }
 
 
-# ---------------------------------------------------------------------------
-# Esecuzione pipeline + visualizzazione risultati
-# ---------------------------------------------------------------------------
-def run_and_display(config: dict, age_stratum_for_unknown_check: str | None = None):
+# ============================================================================
+# ESECUZIONE PIPELINE + DISPLAY
+# ============================================================================
+
+def run_and_display(
+    config: dict,
+    age_stratum: str | None,
+    ae_limit: int | None,
+):
     if not config["target_drug"]:
-        st.warning("Write at least the drug name.")
+        st.warning("Inserisci almeno il nome del farmaco.")
         return
 
-    st.subheader("Parameters")
-    pcol1, pcol2, pcol3 = st.columns(3)
-    pcol1.metric("Drug", config["target_drug"])
-    pcol2.metric("Min occurrences (a)", config["min_a"])
-    pcol3.metric("Filter", config["where_extra"] or "Nessuno")
+    # Avviso report esclusi per filtro età
+    if age_stratum:
+        n_unknown = count_unknown_age_excluded()
+        if n_unknown:
+            st.info(
+                f"Filtro età attivo (`{age_stratum}`): **{n_unknown:,}** report "
+                f"senza età registrata (`age_stratum = 'unknown'`) vengono esclusi "
+                f"sia dal gruppo target che dal baseline."
+            )
 
-    unknown_excluded = count_unknown_age_excluded(age_stratum_for_unknown_check)
-    if unknown_excluded is not None:
-        st.info(
-            f"Age filter active ('{age_stratum_for_unknown_check}'): "
-            f"**{unknown_excluded:,}** the report has no age registered (`age_stratum = 'unknown'`) "
-            f"they are excluded both from the target group and from the baseline of comparison, "
-            f"thus it is not possible with certainty to link them to any filter."
-        )
+    # ── Cache contingency table ───────────────────────────────────────────
+    # La CT dipende solo da (target_drug, where_extra, min_a).
+    # Se questi tre parametri non cambiano, la CT viene riutilizzata
+    # dalla session_state e il passo DuckDB viene saltato completamente.
+    ct_key = (
+        config["target_drug"],
+        config.get("where_extra") or "",
+        config["min_a"],
+    )
+    cached_ct = None
+    if st.session_state.get("_ct_key") == ct_key:
+        cached_ct = st.session_state.get("_ct_cache")
+        if cached_ct is not None:
+            st.caption(
+                f"⚡ Contingency table dalla cache ({len(cached_ct)} coppie) "
+                f"— solo gli algoritmi vengono rieseguiti."
+            )
 
-    with st.spinner("Working..."):
+    # ── Esecuzione pipeline ───────────────────────────────────────────────
+    spinner_msg = (
+        "Eseguendo algoritmi in parallelo (CT dalla cache)…"
+        if cached_ct is not None
+        else "Costruendo la contingency table e calcolando i segnali…"
+    )
+    with st.spinner(spinner_msg):
         try:
-            results = run_pipeline(config)
+            results = run_pipeline(config, precomputed_ct=cached_ct)
         except Exception as e:
-            st.error(f"Error during pipeline execution: {e}")
+            st.error(f"Errore durante l'esecuzione: {e}")
             return
 
+    # ── Aggiorna cache CT se appena ricalcolata ───────────────────────────
+    if cached_ct is None and results.get("error") != "no_data":
+        st.session_state["_ct_cache"] = results["contingency_table"]
+        st.session_state["_ct_key"]   = ct_key
+
     if results.get("error") == "no_data":
-        st.error(f"No couple found for '{config['target_drug']}' with these filters.")
+        st.error(f"Nessuna coppia trovata per **{config['target_drug']}** con questi filtri.")
         return
 
-    # --- Contingency table ---
-    ct = results["contingency_table"]
-    st.subheader(f"Contingency table — {len(ct)} coppie (drug, PT)")
-    st.dataframe(ct, use_container_width=True)
-    st.download_button(
-        "Scarica contingency table (CSV)",
-        data=ct.to_csv(index=False).encode("utf-8"),
-        file_name=f"{config['target_drug']}_contingency.csv",
-        mime="text/csv",
-        key="download_ct",
-    )
+    ct        = results["contingency_table"]
+    validated = results.get("validated", pd.DataFrame())
+    weber     = results.get("weber_check", {})
+    summary   = results.get("run_summary", {})
+    weber_risk = weber.get("weber_risk") or summary.get("weber_risk")
 
-   # Secondo me questo non ci serve (da risultati singoli per ogni modello PRR/ROR/...) 
-    """# --- Risultati per algoritmo ---
-    st.subheader("Risultati per algoritmo")
-    algo_tabs = st.tabs([a.upper() for a in config["algorithms"]])
-    for tab, algo in zip(algo_tabs, config["algorithms"]):
-        with tab:
-            algo_df = results.get(algo)
-            if algo_df is None:
-                st.info(f"Nessun risultato per {algo.upper()} (algoritmo fallito o non eseguito).")
-            elif len(algo_df) == 0:
-                st.info(f"Nessun segnale rilevato da {algo.upper()}.")
-            else:
-                st.dataframe(algo_df, use_container_width=True)
-                st.download_button(
-                    f"Scarica {algo.upper()} (CSV)",
-                    data=algo_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{config['target_drug']}_{algo}.csv",
-                    mime="text/csv",
-                    key=f"download_{algo}",
-                )"""
+    # Raccoglie risultati per algoritmo per il confidence score
+    algo_results = {k: results.get(k) for k in ["prr", "ror", "bcpnn", "mgps"]}
 
-    # --- Validazione label FDA ---
-    st.subheader("Validazione label FDA")
-    validated = results.get("validated")
-    if validated is not None and len(validated) > 0:
-        st.dataframe(validated, use_container_width=True)
-    else:
-        st.info("Nessun segnale validato o validazione disabilitata.")
+    # ── Run summary ────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Riepilogo run</div>', unsafe_allow_html=True)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Farmaco",    config["target_drug"])
+    m2.metric("Coppie CT",  len(ct))
+    m3.metric("Tempo (s)",  summary.get("total_elapsed_s", "—"))
+    m4.metric("Filtro",     config["where_extra"] or "Nessuno")
 
-    # --- Weber effect check ---
-    st.subheader("Weber effect check")
-    weber = results.get("weber_check")
-    if weber:
-        st.json(weber)
-    else:
-        st.info("Weber check disabled or no data present.")
-
-    # --- Run summary ---
-    st.subheader("Run summary")
-    summary = results.get("run_summary", {})
-
-    st.metric("Tempo totale (s)", summary.get("total_elapsed_s", "—"))
-
-    algo_results_summary = summary.get("algorithm_results", {})
-    if algo_results_summary:
-        rows = [
-            {"algoritmo": algo.upper(), "positivi": stats.get("positive"), "coppie_valutate": stats.get("total_pairs")}
-            for algo, stats in algo_results_summary.items()
+    if summary.get("algorithm_results"):
+        algo_rows = [
+            {"Algoritmo": a.upper(),
+             "Segnali positivi": s["positive"],
+             "Coppie valutate": s["total_pairs"]}
+            for a, s in summary["algorithm_results"].items()
         ]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(algo_rows), use_container_width=True, hide_index=True)
 
-    if summary.get("validation"):
-        v = summary["validation"]
-        vcol1, vcol2, vcol3 = st.columns(3)
-        vcol1.metric("KNOWN", v.get("KNOWN", 0))
-        vcol2.metric("POTENTIALLY NEW", v.get("POTENTIALLY_NEW", 0))
-        vcol3.metric("NO LABEL", v.get("NO_LABEL", 0))
+    # ── Segnali AE ordinati per confidence ────────────────────────────────
+    st.markdown('<div class="section-header">Adverse Events rilevati</div>', unsafe_allow_html=True)
 
-    if summary.get("weber_risk"):
-        st.metric("Weber effect risk", summary["weber_risk"])
+    ranked = compute_confidence_score(validated, algo_results)
 
-    st.success(
-        f"I segnali validati di questa run sono stati aggiunti a "
-        f"`signals_full.parquet` per il pannello panoramico qui sotto."
-    )
+    if not ranked.empty:
+        render_ae_list(ranked, weber_risk=weber_risk, limit=ae_limit)
+    else:
+        st.info("Nessun segnale positivo rilevato con i parametri correnti.")
+
+    # ── Validazione label FDA (tabella completa) ───────────────────────────
+    with st.expander("📋 Tabella completa segnali validati"):
+        if validated is not None and len(validated) > 0:
+            st.dataframe(validated, use_container_width=True)
+            st.download_button(
+                "Scarica segnali (CSV)",
+                data=validated.to_csv(index=False).encode("utf-8"),
+                file_name=f"{config['target_drug']}_signals.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("Nessun segnale validato.")
+
+    # ── Weber detail ───────────────────────────────────────────────────────
+    with st.expander("⏱ Weber effect — dettaglio"):
+        if weber:
+            st.json(weber)
+        else:
+            st.info("Weber check disabilitato o nessun dato disponibile.")
+
+    # ── Contingency table ──────────────────────────────────────────────────
+    with st.expander("🔢 Contingency table"):
+        st.dataframe(ct, use_container_width=True)
+        st.download_button(
+            "Scarica CT (CSV)",
+            data=ct.to_csv(index=False).encode("utf-8"),
+            file_name=f"{config['target_drug']}_ct.csv",
+            mime="text/csv",
+        )
 
 
-# ---------------------------------------------------------------------------
-# 4 blocchi di input — dropdown di suggerimenti + possibilita di scrivere
-# un valore libero (accept_new_options richiede Streamlit >= 1.40)
-# ---------------------------------------------------------------------------
-st.subheader("Parametri di analisi")
+# ============================================================================
+# HEADER
+# ============================================================================
+
+st.title("Drug Safety Signal Detection")
+st.markdown(
+    "Disproportionality analysis su dati FAERS — rilevamento segnali di sicurezza farmaci."
+)
+
+# ============================================================================
+# INPUT PARAMETRI
+# ============================================================================
+
+st.markdown('<div class="section-header">Parametri di analisi</div>', unsafe_allow_html=True)
+
+# Carica indice farmaci (lazy, cached)
+drug_index = load_drug_index()
 
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    target_drug = st.selectbox(
-        "Drug",
+    drug_input_raw = st.selectbox(
+        "Farmaco",
         options=SUGGESTED_DRUGS,
         index=None,
-        placeholder="es. LAPATINIB",
+        placeholder="es. LAPATINIB, ibuprofen, brufen…",
         accept_new_options=True,
         key="drug_input",
     )
 
 with col2:
-    sex = st.selectbox(
-        "Sex",
+    sex_input = st.selectbox(
+        "Sesso",
         options=SEX_OPTIONS,
         index=0,
-        accept_new_options=True,
         key="sex_input",
     )
 
 with col3:
-    age_stratum = st.selectbox(
-        "Age",
-        options=AGE_OPTIONS,
-        index=0,
-        accept_new_options=True,
+    age_input_raw = st.text_input(
+        "Età (anni o fascia)",
+        placeholder="es. 45 → adult | 10 → pediatric | 70 → geriatric",
         key="age_input",
     )
 
 with col4:
-    comedication = st.selectbox(
-        "Co-medication",
+    comed_input_raw = st.selectbox(
+        "Co-medicazione",
         options=SUGGESTED_DRUGS,
         index=None,
         placeholder="opzionale, es. CAPECITABINE",
@@ -290,77 +780,152 @@ with col4:
         key="comedication_input",
     )
 
-
-# ---------------------------------------------------------------------------
-# Parametri avanzati [Anche questo secondo me non serve]
-# ---------------------------------------------------------------------------
+# ── Parametri avanzati ──────────────────────────────────────────────────────
 with st.expander("Parametri avanzati"):
-    adv_col1, adv_col2 = st.columns(2)
+    adv1, adv2 = st.columns(2)
 
-    with adv_col1:
+    with adv1:
         algorithms = st.multiselect(
-            "Algoritmi",
-            ["prr", "ror", "bcpnn", "mgps"],
-            default=DEFAULT_ALGORITHMS,
-            key="algorithms_input",
+            "Algoritmi", ["prr","ror","bcpnn","mgps"],
+            default=DEFAULT_ALGORITHMS, key="algorithms_input",
         )
-        min_a = st.number_input("Min occorrenze (a)", min_value=1, value=DEFAULT_MIN_A, step=1, key="min_a_input")
+        min_a = st.number_input(
+            "Min occorrenze (a)", min_value=1, value=DEFAULT_MIN_A, step=1, key="min_a_input",
+        )
         fdr_threshold = st.number_input(
             "Soglia FDR (PRR/ROR)", min_value=0.0, max_value=1.0,
-            value=DEFAULT_FDR_THRESHOLD, step=0.01, key="fdr_input",
+            value=DEFAULT_FDR, step=0.01, key="fdr_input",
         )
 
-    with adv_col2:
+    with adv2:
         eb05_threshold = st.number_input(
-            "Soglia EB05 (MGPS)", min_value=0.0, value=DEFAULT_EB05_THRESHOLD, step=0.1, key="eb05_input",
+            "Soglia EB05 (MGPS)", min_value=0.0, value=DEFAULT_EB05, step=0.1, key="eb05_input",
         )
         ic_threshold = st.number_input(
-            "Soglia IC025 (BCPNN)", value=DEFAULT_IC_THRESHOLD, step=0.1, key="ic_input",
+            "Soglia IC025 (BCPNN)", value=DEFAULT_IC, step=0.1, key="ic_input",
         )
         weber_override = st.text_input(
-            "Anno approvazione (override Weber, opzionale)", placeholder="es. 2007", key="weber_override_input",
+            "Anno approvazione (override Weber)", placeholder="es. 2007", key="weber_override_input",
+        )
+        mistral_key = st.text_input(
+            "Mistral API key (fallback drug name)", type="password", key="mistral_key_input",
         )
 
-    openfda_api_key = st.text_input("openFDA API key (opzionale)", type="password", key="api_key_input")
-    validate_label = st.checkbox("Validazione label FDA", value=True, key="validate_input")
-    check_weber = st.checkbox("Weber effect check", value=True, key="weber_check_input")
+    openfda_api_key = st.text_input(
+        "openFDA API key (opzionale)", type="password", key="api_key_input",
+    )
+    validate_label_cb = st.checkbox("Validazione label FDA", value=True, key="validate_input")
+    check_weber_cb    = st.checkbox("Weber effect check",    value=True, key="weber_check_input")
 
+# ── Filtro visualizzazione AE ────────────────────────────────────────────────
+ae_limit_map = {"Top 5": 5, "Top 10": 10, "Top 20": 20, "Tutti": None}
+ae_limit_label = st.radio(
+    "Mostra AE",
+    options=list(ae_limit_map.keys()),
+    index=1,
+    horizontal=True,
+    key="ae_limit_input",
+)
+ae_limit = ae_limit_map[ae_limit_label]
 
-# ---------------------------------------------------------------------------
-# Bottone esecuzione
-# ---------------------------------------------------------------------------
-if st.button("Esegui"):
-    where_extra = build_where_extra(sex, age_stratum, comedication or "")
-    weber_override_int = int(weber_override) if weber_override.strip().isdigit() else None
+# ============================================================================
+# BOTTONE ESEGUI
+# ============================================================================
+
+if st.button("▶ Esegui analisi", type="primary"):
+
+    # ── Risolvi nome farmaco ─────────────────────────────────────────────
+    if not drug_input_raw:
+        st.warning("Inserisci il nome del farmaco.")
+        st.stop()
+
+    resolved_drug, drug_method, drug_score = resolve_drug_name(
+        drug_input_raw, drug_index, mistral_key or None
+    )
+
+    if drug_method == "fuzzy":
+        st.markdown(
+            f'<span class="match-chip">🔍 "{drug_input_raw}" → <strong>{resolved_drug}</strong> '
+            f'(fuzzy match, score {drug_score:.0f}/100)</span>',
+            unsafe_allow_html=True,
+        )
+    elif drug_method == "mistral":
+        st.markdown(
+            f'<span class="match-chip">🤖 "{drug_input_raw}" → <strong>{resolved_drug}</strong> '
+            f'(via Mistral AI)</span>',
+            unsafe_allow_html=True,
+        )
+    elif drug_method == "passthrough":
+        st.warning(
+            f"Nessun match affidabile trovato per '{drug_input_raw}'. "
+            f"Procedo con il nome inserito — se non vengono trovate coppie, "
+            f"prova il nome in inglese o il principio attivo."
+        )
+
+    # ── Risolvi co-medicazione ───────────────────────────────────────────
+    resolved_comed = None
+    if comed_input_raw and str(comed_input_raw).strip():
+        resolved_comed, comed_method, comed_score = resolve_comedication(
+            str(comed_input_raw), drug_index, mistral_key or None
+        )
+        if comed_method == "fuzzy" and comed_score < 100:
+            st.markdown(
+                f'<span class="match-chip">🔍 Co-med: "{comed_input_raw}" → '
+                f'<strong>{resolved_comed}</strong> (score {comed_score:.0f}/100)</span>',
+                unsafe_allow_html=True,
+            )
+        elif comed_method == "mistral":
+            st.markdown(
+                f'<span class="match-chip">🤖 Co-med: "{comed_input_raw}" → '
+                f'<strong>{resolved_comed}</strong> (via Mistral AI)</span>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Risolvi età ──────────────────────────────────────────────────────
+    age_stratum = age_to_stratum(age_input_raw)
+    if age_input_raw.strip() and age_stratum:
+        st.markdown(
+            f'<span class="match-chip">👤 Età "{age_input_raw}" → '
+            f'<strong>{age_stratum}</strong></span>',
+            unsafe_allow_html=True,
+        )
+    elif age_input_raw.strip() and not age_stratum:
+        st.warning(f"Input età '{age_input_raw}' non riconosciuto — nessun filtro applicato.")
+
+    # ── Costruisci where_extra ───────────────────────────────────────────
+    where_extra = build_where_extra(sex_input, age_stratum, resolved_comed)
+
+    # ── Costruisci config ────────────────────────────────────────────────
+    weber_override_int = int(weber_override.strip()) if weber_override.strip().isdigit() else None
 
     config = build_config_from_ui(
-        target_drug=target_drug or "",
+        target_drug=resolved_drug,
         where_extra=where_extra,
         min_a=min_a,
         algorithms=algorithms,
         fdr_threshold=fdr_threshold,
         eb05_threshold=eb05_threshold,
         ic_threshold=ic_threshold,
-        openfda_api_key=openfda_api_key,
-        validate_label=validate_label,
-        check_weber=check_weber,
+        openfda_api_key=openfda_api_key or None,
+        validate_label=validate_label_cb,
+        check_weber=check_weber_cb,
         weber_approval_override=weber_override_int,
     )
 
-    run_and_display(config, age_stratum_for_unknown_check=age_stratum)
+    run_and_display(config, age_stratum=age_stratum, ae_limit=ae_limit)
 
 
-# ---------------------------------------------------------------------------
-# Pannello panoramico — legge signals_full.parquet (storico cumulativo di
-# tutti i segnali validati nelle run precedenti, scritto da run_pipeline())
-# ---------------------------------------------------------------------------
+# ============================================================================
+# PANNELLO PANORAMICO
+# ============================================================================
+
 st.divider()
-st.subheader("Panoramica segnali storici (signals_full.parquet)")
+st.markdown('<div class="section-header">Panoramica segnali storici</div>', unsafe_allow_html=True)
 
 if SIGNALS_FULL_PATH.exists():
     try:
         signals_full = pd.read_parquet(SIGNALS_FULL_PATH)
-        st.caption(f"{len(signals_full)} segnali totali registrati finora.")
+        st.caption(f"{len(signals_full)} segnali totali registrati nelle run precedenti.")
         st.dataframe(signals_full, use_container_width=True)
         st.download_button(
             "Scarica signals_full (CSV)",
@@ -370,9 +935,9 @@ if SIGNALS_FULL_PATH.exists():
             key="download_signals_full",
         )
     except Exception as e:
-        st.error(f"Errore durante la lettura di signals_full.parquet: {e}")
+        st.error(f"Errore nella lettura di signals_full.parquet: {e}")
 else:
     st.info(
-        "Nessun signals_full.parquet trovato ancora. "
+        "Nessun signals_full.parquet trovato. "
         "Esegui almeno un'analisi per popolare il pannello panoramico."
     )

@@ -1,41 +1,46 @@
-#script that orchestrates the logic of the signals, calling 
-#the functions from src 
 """
-run_signals.py
+run_signals.py  —  pipeline di signal detection (versione ottimizzata)
 
-Orchestrazione della pipeline di signal detection.
-Restituisce i risultati in memoria come dizionario di DataFrame,
-senza scrivere file temporanei su disco.
+Ottimizzazioni rispetto alla versione precedente
+─────────────────────────────────────────────────
+1. Algoritmi in parallelo
+   PRR / ROR / BCPNN / MGPS girano con ThreadPoolExecutor(max_workers=4).
+   Il tempo totale degli algoritmi = tempo del più lento (MGPS), non la somma.
 
-Le uniche scritture su disco sono:
-    data/label_cache.json    — cache delle chiamate API openFDA label (costose)
-    data/approval_cache.json — cache degli anni di approvazione FDA (weber_check)
+2. Validazione label + Weber in parallelo
+   Le due chiamate HTTP a openFDA sono indipendenti e girano in parallelo
+   con ThreadPoolExecutor(max_workers=2).
+   Cache JSON su disco (label_cache.json, approval_cache.json) già presente:
+   al secondo run queste chiamate sono gratuite (sub-millisecondo).
 
-Utilizzo attuale (senza dashboard):
-    results = run_pipeline(get_run_config())
+3. run_pipeline() accetta precomputed_ct
+   Se la contingency table è già in session_state (stesso farmaco + filtri),
+   il passo DuckDB viene saltato completamente.
+   Chiamata da appli.py:
+       run_pipeline(config, precomputed_ct=st.session_state["ct"])
 
-Utilizzo futuro (con dashboard):
-    config  = build_config_from_ui(user_input)   # parametri dal form Streamlit
-    results = run_pipeline(config)               # stessa funzione, nessuna modifica
-    # risultati disponibili in st.session_state per tutta la sessione
+4. Timing granulare
+   Ogni step stampa il proprio tempo. Utile per individuare il collo di
+   bottiglia reale sulla macchina specifica.
 
-Struttura del dict restituito da run_pipeline():
+Struttura del dict restituito da run_pipeline() — invariata:
     {
-        "config":             dict            — parametri usati
-        "contingency_table":  pd.DataFrame    — CT 2x2
+        "config":             dict
+        "contingency_table":  pd.DataFrame
         "prr":                pd.DataFrame | None
         "ror":                pd.DataFrame | None
         "bcpnn":              pd.DataFrame | None
         "mgps":               pd.DataFrame | None
-        "validated":          pd.DataFrame    — segnali con validazione label FDA
-        "weber_check":        dict            — risultato check Weber effect
-        "run_summary":        dict            — metadata (tempi, conteggi)
+        "validated":          pd.DataFrame
+        "weber_check":        dict
+        "run_summary":        dict
     }
 """
 
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -46,41 +51,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.contingency_table import build_contingency_table, qc_contingency_table
 from src.signals import compute_prr, compute_ror, compute_bcpnn, compute_mgps
 from src.validate_label import validate_signals, validation_summary
-from src.weber_check import check_weber_effect, weber_summary          # <-- NUOVO
+from src.weber_check import check_weber_effect, weber_summary
 
 PARQUET_PATH = Path(__file__).resolve().parent / "data" / "faers_flat_deduped.parquet"
 CONFIG_FILE  = Path(__file__).resolve().parent / "run_config.json"
 
 
-# ── CONFIGURAZIONE ───────────────────────────────────────────────────────────
-# get_run_config() è l'unico punto che cambierà con l'integrazione della dashboard.
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURAZIONE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_run_config() -> dict:
-    """
-    Restituisce la configurazione del run corrente.
-
-    Ordine di priorità:
-        1. CONFIG_FILE (run_config.json) se presente — utile per test ripetibili
-        2. Valori di default hardcoded — utile per sviluppo e CI
-
-    Struttura del dict restituito:
-    {
-        "target_drug":            str        — nome farmaco in uppercase, es. "LAPATINIB"
-        "where_extra":            str | None — filtro SQL per stratificazione
-        "min_a":                  int        — soglia minima cella a della CT (default 3)
-        "algorithms":             list       — sottoinsieme di ["prr", "ror", "bcpnn", "mgps"]
-        "fdr_threshold":          float      — soglia FDR per PRR e ROR (default 0.05)
-        "eb05_threshold":         float      — soglia EB05 per MGPS (default 2.0)
-        "ic_threshold":           float      — soglia IC025 per BCPNN (default 0.0)
-        "openfda_api_key":        str | None — chiave API openFDA opzionale
-        "validate_label":         bool       — se True esegue validazione label FDA
-        "check_weber":            bool       — se True esegue Weber effect check
-        "weber_approval_override":int | None — anno di approvazione manuale (bypassa API)
-    }
-
-    TODO (dashboard): sostituire con build_config_from_ui(user_input) che riceve
-    i parametri dal form Streamlit e restituisce lo stesso dict.
-    """
     defaults = {
         "target_drug":             "LAPATINIB",
         "where_extra":             None,
@@ -91,14 +72,12 @@ def get_run_config() -> dict:
         "ic_threshold":            0.0,
         "openfda_api_key":         None,
         "validate_label":          True,
-        "check_weber":             True,       
-        "weber_approval_override": None,       # <-- NUOVO
+        "check_weber":             True,
+        "weber_approval_override": None,
     }
-
     if CONFIG_FILE.exists():
         print(f"  [CONFIG] Carico parametri da {CONFIG_FILE}")
-        user_config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        defaults.update(user_config)
+        defaults.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
     else:
         print(f"  [CONFIG] {CONFIG_FILE} non trovato, uso valori di default")
 
@@ -106,53 +85,106 @@ def get_run_config() -> dict:
     return defaults
 
 
-# ── LOGICA DI ESECUZIONE ─────────────────────────────────────────────────────
-# Queste funzioni non cambieranno con l'integrazione della dashboard.
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Contingency table
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_ct(config: dict) -> pd.DataFrame:
+    """
+    Costruisce la contingency table via DuckDB.
+    
+    Passa esplicitamente threads e memory_limit per evitare che DuckDB
+    usi i default conservativi del container (1 thread, 256MB).
+    Il Parquet viene letto una sola volta grazie alla view registrata
+    dentro build_contingency_table().
+    """
+    return build_contingency_table(
+        parquet_path=str(PARQUET_PATH),
+        target_drug=config["target_drug"],
+        min_a=config["min_a"],
+        where_extra=config["where_extra"],
+        duckdb_threads=2,
+        duckdb_memory="1500MB",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Algoritmi (eseguiti in parallelo)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_algorithm(name: str, ct: pd.DataFrame, config: dict) -> pd.DataFrame | None:
     """
-    Esegue un singolo algoritmo di disproportionality analysis.
-    Gestisce le eccezioni in isolamento: se un algoritmo fallisce,
-    gli altri continuano.
+    Esegue un singolo algoritmo in isolamento.
+    Un'eccezione in un algoritmo non blocca gli altri.
     """
     fn_map = {
-        "prr":   lambda: compute_prr(ct,
+        "prr":   lambda: compute_prr(
+                     ct,
                      min_events=config["min_a"],
                      decision_thres=config["fdr_threshold"]),
-        "ror":   lambda: compute_ror(ct,
+        "ror":   lambda: compute_ror(
+                     ct,
                      min_events=config["min_a"],
                      decision_thres=config["fdr_threshold"]),
-        "bcpnn": lambda: compute_bcpnn(ct,
+        "bcpnn": lambda: compute_bcpnn(
+                     ct,
                      min_events=config["min_a"],
                      ic_threshold=config["ic_threshold"]),
-        "mgps":  lambda: compute_mgps(ct,
+        "mgps":  lambda: compute_mgps(
+                     ct,
                      min_events=config["min_a"],
                      eb05_threshold=config["eb05_threshold"]),
+        # force_priors=True è già il default di compute_mgps:
+        # salta l'ottimizzazione numerica dei prior (la parte più lenta di MGPS)
     }
 
     if name not in fn_map:
         print(f"  [WARN] Algoritmo '{name}' non riconosciuto, saltato")
         return None
 
+    t0 = time.time()
     try:
-        t0      = time.time()
         result  = fn_map[name]()
         elapsed = time.time() - t0
-        n_pos   = result["signal_positive"].sum()
-        print(f"  [{name.upper()}] {len(result)} coppie, "
-              f"{n_pos} segnali positivi — {elapsed:.1f}s")
+        n_pos   = int(result["signal_positive"].sum())
+        print(f"  [{name.upper():5}] {len(result):>5} coppie · {n_pos:>4} positivi · {elapsed:.2f}s")
         return result
-
     except Exception as e:
-        print(f"  [ERR] {name.upper()} fallito: {e}")
+        print(f"  [ERR] {name.upper()} fallito ({time.time()-t0:.2f}s): {e}")
         return None
 
 
-def build_validated_union(results: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def _run_algorithms_parallel(ct: pd.DataFrame, config: dict) -> dict[str, pd.DataFrame | None]:
     """
-    Unisce i segnali positivi di tutti gli algoritmi in un unico DataFrame
-    con una colonna 'algorithm' che indica la provenienza di ogni riga.
-    Un AE rilevato da più algoritmi appare più volte (una per algoritmo).
+    Esegue tutti gli algoritmi configurati in parallelo.
+    Ordine dei risultati: determinato da as_completed, non dall'ordine di input.
+    """
+    algo_results: dict[str, pd.DataFrame | None] = {}
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(run_algorithm, name, ct, config): name
+            for name in config["algorithms"]
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                algo_results[name] = future.result()
+            except Exception as e:
+                print(f"  [ERR] Future {name} fallita: {e}")
+                algo_results[name] = None
+
+    return algo_results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Unione segnali positivi
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_validated_union(results: dict[str, pd.DataFrame | None]) -> pd.DataFrame:
+    """
+    Unisce i segnali positivi di tutti gli algoritmi.
+    Ogni AE appare una riga per algoritmo che lo ha rilevato.
     """
     frames = []
     for algo_name, df in results.items():
@@ -162,24 +194,80 @@ def build_validated_union(results: dict[str, pd.DataFrame]) -> pd.DataFrame:
         positive["algorithm"] = algo_name
         frames.append(positive)
 
-    if not frames:
-        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    return pd.concat(frames, ignore_index=True)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4+5 — Validazione label FDA + Weber (eseguiti in parallelo)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_validation(validated_union: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Valida i segnali positivi contro il bugiardino openFDA."""
+    if not config.get("validate_label", True) or len(validated_union) == 0:
+        print("  [SKIP] Validazione label disabilitata o nessun segnale positivo")
+        return validated_union
+
+    t0 = time.time()
+    result = validate_signals(
+        signals_df=validated_union,
+        drug_name=config["target_drug"].lower(),
+        api_key=config.get("openfda_api_key"),
+    )
+    print(f"  [LABEL ] Validazione completata in {time.time()-t0:.2f}s")
+    validation_summary(result)
+    return result
+
+
+def _run_weber(config: dict) -> dict:
+    """Esegue il Weber effect check."""
+    if not config.get("check_weber", True):
+        print("  [SKIP] Weber check disabilitato")
+        return {}
+
+    t0 = time.time()
+    result = check_weber_effect(
+        parquet_path=str(PARQUET_PATH),
+        target_drug=config["target_drug"],
+        api_key=config.get("openfda_api_key"),
+        approval_year_override=config.get("weber_approval_override"),
+    )
+    print(f"  [WEBER ] Weber check completato in {time.time()-t0:.2f}s")
+    weber_summary(result)
+    return result
+
+
+def _run_validation_and_weber_parallel(
+    validated_union: pd.DataFrame,
+    config: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Esegue validazione label FDA e Weber check in parallelo.
+    Entrambi fanno chiamate HTTP a openFDA — sono I/O-bound e indipendenti.
+    Il guadagno è netto al primo run; i run successivi usano cache JSON locale
+    e sono già sub-secondo indipendentemente dal parallelismo.
+    """
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fut_label = executor.submit(_run_validation, validated_union, config)
+        fut_weber = executor.submit(_run_weber, config)
+
+        validated = fut_label.result()
+        weber     = fut_weber.result()
+
+    return validated, weber
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — Run summary
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_run_summary(
-        config:        dict,
-        algo_results:  dict[str, pd.DataFrame],
-        validated:     pd.DataFrame,
-        weber:         dict,
-        total_elapsed: float,
+    config:        dict,
+    algo_results:  dict[str, pd.DataFrame | None],
+    validated:     pd.DataFrame,
+    weber:         dict,
+    total_elapsed: float,
+    ct_from_cache: bool = False,
 ) -> dict:
-    """
-    Costruisce il dizionario di metadata del run.
-    In futuro il dashboard può mostrare questi dati nella UI
-    senza dover rieseguire la pipeline.
-    """
     algo_stats = {}
     for name, df in algo_results.items():
         if df is not None:
@@ -203,6 +291,7 @@ def build_run_summary(
         "where_extra":       config["where_extra"],
         "min_a":             config["min_a"],
         "algorithms":        config["algorithms"],
+        "ct_from_cache":     ct_from_cache,          # flag utile per il dashboard
         "thresholds": {
             "fdr":  config["fdr_threshold"],
             "eb05": config["eb05_threshold"],
@@ -210,21 +299,30 @@ def build_run_summary(
         },
         "algorithm_results": algo_stats,
         "validation":        val_stats,
-        "weber_risk":        weber.get("weber_risk"),           
+        "weber_risk":        weber.get("weber_risk"),
         "total_elapsed_s":   round(total_elapsed, 1),
     }
 
 
-def run_pipeline(config: dict) -> dict:
-    """
-    Esegue la pipeline completa e restituisce tutti i risultati in memoria.
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT PRINCIPALE
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Questa è la funzione principale da chiamare — sia nella modalità attuale
-    (CLI / script) che in futuro dalla dashboard Streamlit.
+def run_pipeline(
+    config: dict,
+    precomputed_ct: pd.DataFrame | None = None,
+) -> dict:
+    """
+    Esegue la pipeline completa di signal detection.
 
     Parameters
     ----------
-    config : dict — output di get_run_config() o di build_config_from_ui()
+    config : dict
+        Output di get_run_config() o build_config_from_ui().
+    precomputed_ct : pd.DataFrame | None
+        Se fornita, salta il calcolo della contingency table (DuckDB).
+        Usare quando target_drug + where_extra + min_a non sono cambiati
+        rispetto al run precedente (cache in appli.py via st.session_state).
 
     Returns
     -------
@@ -233,19 +331,24 @@ def run_pipeline(config: dict) -> dict:
         validated, weber_check, run_summary
     """
     t_start = time.time()
+    ct_from_cache = False
 
-    print(f"\n  Drug target    : {config['target_drug']}")
+    print(f"\n{'='*55}")
+    print(f"  Farmaco        : {config['target_drug']}")
     print(f"  Stratificazione: {config['where_extra'] or 'globale'}")
     print(f"  Algoritmi      : {config['algorithms']}")
+    print(f"{'='*55}")
 
-    # STEP 1: Contingency table
-    print("\n=== Contingency table ===")
-    ct = build_contingency_table(
-        parquet_path=str(PARQUET_PATH),
-        target_drug=config["target_drug"],
-        min_a=config["min_a"],
-        where_extra=config["where_extra"],
-    )
+    # ── STEP 1: Contingency table ─────────────────────────────────────────
+    if precomputed_ct is not None:
+        ct = precomputed_ct
+        ct_from_cache = True
+        print(f"\n[CT    ] Riutilizzata dalla cache — {len(ct)} coppie (0.00s)")
+    else:
+        print("\n[CT    ] Costruzione contingency table...")
+        t0 = time.time()
+        ct = _build_ct(config)
+        print(f"[CT    ] {len(ct)} coppie trovate — {time.time()-t0:.2f}s")
 
     if len(ct) == 0:
         print(f"  [ERR] Nessuna coppia trovata per '{config['target_drug']}'.")
@@ -253,66 +356,57 @@ def run_pipeline(config: dict) -> dict:
 
     qc_contingency_table(ct, label=config["target_drug"])
 
-    # STEP 2: Signal detection
-    print("\n=== Signal detection ===")
-    algo_results = {}
-    for algo in config["algorithms"]:
-        algo_results[algo] = run_algorithm(algo, ct, config)
+    # ── STEP 2: Algoritmi in parallelo ───────────────────────────────────
+    print("\n[ALGOS ] Esecuzione parallela algoritmi...")
+    t0 = time.time()
+    algo_results = _run_algorithms_parallel(ct, config)
+    print(f"[ALGOS ] Completati in {time.time()-t0:.2f}s (parallelo)")
 
-    # STEP 3: Validazione label FDA
-    print("\n=== Validazione label FDA ===")
-    validated = build_validated_union(algo_results)
+    # ── STEP 3: Unione segnali positivi ──────────────────────────────────
+    validated_union = build_validated_union(algo_results)
+    print(f"\n[UNION ] {len(validated_union)} segnali positivi totali (tutte le sorgenti)")
 
-    if config["validate_label"] and len(validated) > 0:
-        validated = validate_signals(
-            signals_df=validated,
-            drug_name=config["target_drug"].lower(),
-            api_key=config["openfda_api_key"],
-        )
-        validation_summary(validated)
-    else:
-        print("  [SKIP] Validazione disabilitata o nessun segnale positivo")
+    # ── STEP 4+5: Validazione label + Weber in parallelo ─────────────────
+    print("\n[API   ] Validazione label FDA + Weber check in parallelo...")
+    t0 = time.time()
+    validated, weber = _run_validation_and_weber_parallel(validated_union, config)
+    print(f"[API   ] Completati in {time.time()-t0:.2f}s (parallelo)")
 
-    # STEP 4: Weber effect check                                    
-    print("\n=== Weber effect check ===")
-    weber = {}
-    if config.get("check_weber", True):
-        weber = check_weber_effect(
-            parquet_path=str(PARQUET_PATH),
-            target_drug=config["target_drug"],
-            api_key=config.get("openfda_api_key"),
-            approval_year_override=config.get("weber_approval_override"),
-        )
-        weber_summary(weber)
-    else:
-        print("  [SKIP] Weber check disabilitato")
-
-    # STEP 5: Run summary
-    print("\n=== Run summary ===")
+    # ── STEP 6: Summary ───────────────────────────────────────────────────
+    total_elapsed = time.time() - t_start
     run_summary = build_run_summary(
         config=config,
         algo_results=algo_results,
         validated=validated,
         weber=weber,
-        total_elapsed=time.time() - t_start,
+        total_elapsed=total_elapsed,
+        ct_from_cache=ct_from_cache,
     )
 
-    print(f"\n=== Completato in {run_summary['total_elapsed_s']}s ===")
-    # Persisti i segnali su disco per il pannello panoramico del dashboard
-    SIGNALS_OUT = Path(__file__).resolve().parent / "data" / "signals_full.parquet"
+    print(f"\n{'='*55}")
+    print(f"  TOTALE: {run_summary['total_elapsed_s']}s "
+          f"({'CT dalla cache' if ct_from_cache else 'CT ricalcolata'})")
+    print(f"{'='*55}\n")
+
+    # ── Scrivi su disco per il pannello panoramico ────────────────────────
+    SIGNALS_OUT = Path(__file__).resolve().parent / "data" / "signals_latest.parquet"
     if len(validated) > 0:
         validated.to_parquet(SIGNALS_OUT, index=False)
-        print(f"  [OK] signals_full.parquet scritto ({len(validated)} righe)")
+        print(f"  [OK] {SIGNALS_OUT.name} scritto ({len(validated)} righe)")
 
     return {
         "config":            config,
         "contingency_table": ct,
-        **algo_results,         # prr, ror, bcpnn, mgps — ognuno None se fallito
+        **algo_results,
         "validated":         validated,
-        "weber_check":       weber,            
+        "weber_check":       weber,
         "run_summary":       run_summary,
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     config  = get_run_config()
@@ -331,4 +425,3 @@ if __name__ == "__main__":
         print(f"    NO LABEL       : {v.get('NO_LABEL', 0)}")
     if summary.get("weber_risk"):
         print(f"\n  Weber effect risk: {summary['weber_risk']}")
-

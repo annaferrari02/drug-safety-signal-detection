@@ -2,5 +2,13 @@
   "lapatinib": {
     "year": 2007,
     "source": "openfda"
+  },
+  "tamoxifen": {
+    "year": 2003,
+    "source": "openfda"
+  },
+  "ketoprofen": {
+    "year": 1993,
+    "source": "openfda"
   }
 }
