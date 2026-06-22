@@ -14,6 +14,7 @@ def lbe(
     n_significant=None,
 ):
 
+    pvals = np.asarray(pvals, dtype=np.float64).ravel()
     if min(pvals) < 0 or max(pvals) > 1:
         raise ValueError("ERROR: p-values not in valid range.")
 
@@ -23,14 +24,14 @@ def lbe(
         if a is not None and a < 1:
             a = None
             sdbound = np.sqrt(1 / (3 * m))
-            pi0 = min(1, np.mean(pvals) * 2)
+            pi0 = float(min(1.0, float(np.mean(pvals)) * 2))
             icpi0 = [0, pi0 - norm.ppf((1 - ci_level), 0, sdbound)]
 
         else:
             if a is None:
-                a = lbe_a(m, lb)
+                a = float(lbe_a(m, lb))
             sdbound = np.sqrt((1 / (gamma(a + 1)) ** 2) * ((gamma(2 * a + 1) - (gamma(a + 1)) ** 2) / m))
-            pi0 = min(1, np.mean((-np.log(1 - pvals)) ** a) / gamma(a + 1))
+            pi0 = float(min(1.0, float(np.mean((-np.log(1 - pvals)) ** a) / gamma(a + 1))))
             icpi0 = [0, min(1, pi0 - norm.ppf((1 - ci_level), 0, sdbound))]
 
         if qvalues:
@@ -81,8 +82,8 @@ def lbe(
 
 
 def lbe_a(m, l):
-    aopt = max(1, minimize(asearch, [1], bounds=[(0.3, 25)], args=(m, l), method="CG").x)
-    return aopt
+    aopt = max(1, minimize(asearch, [1], bounds=[(0.3, 25)], args=(m, l), method="CG").x[0])
+    return float(aopt)
 
 
 def asearch(a, m, l):

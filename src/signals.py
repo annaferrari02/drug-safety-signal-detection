@@ -25,15 +25,18 @@ def contingency_to_vigipy(ct: pd.DataFrame) -> tuple[Container, int]:
     df["product_aes"]         = df["events"] + df["b"]
     df["count_across_brands"] = df["events"] + df["c"]
 
+    # Forza dtype numerico su tutte le colonne numeriche — evita che
+    # colonne con dtype object (dalla route cubo OLAP) causino
+    # "setting an array element with a sequence" in np.asarray() dentro PRR/ROR
+    for col in ["events", "product_aes", "count_across_brands", "b", "c", "d", "n"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+
     N = int(df["n"].iloc[0])
 
     container = Container(params=False)
     container.data = df[["product_name", "ae_name", "events",
                           "product_aes", "count_across_brands"]]
     container.N = N
-
-    # FIX: fillna(0) + astype(float) evita "setting an array element with a sequence"
-    # che PRR e ROR lanciano quando la pivot ha dtype object per NaN misti
     container.contingency = df.pivot_table(
         index="product_name",
         columns="ae_name",
@@ -46,6 +49,8 @@ def contingency_to_vigipy(ct: pd.DataFrame) -> tuple[Container, int]:
 
 def compute_prr(ct, min_events=3, decision_thres=0.05):
     container, _ = contingency_to_vigipy(ct)
+    if container is None:
+        return pd.DataFrame()
     results = prr(
         container,
         relative_risk=1,
@@ -64,6 +69,8 @@ def compute_prr(ct, min_events=3, decision_thres=0.05):
 
 def compute_ror(ct, min_events=3, decision_thres=0.05):
     container, _ = contingency_to_vigipy(ct)
+    if container is None:
+        return pd.DataFrame()
     results = ror(
         container,
         relative_risk=1,
