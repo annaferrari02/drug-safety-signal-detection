@@ -3,9 +3,12 @@ dashboard/appli.py
 
 Disproportionality analysis pipeline on FAERS data.
 
-Drug name resolution flow:
-    1. rapidfuzz — fuzzy match against drug_name in Parquet
-    2. Mistral AI fallback — if score < threshold, resolves active ingredient in English
+Drug name resolution is delegated to src/match_drug.py:
+    resolve_drug_name() — four-step cascade:
+        0. Local brand → INN dictionary (offline)
+        1. Exact match against Parquet drug index
+        2. rapidfuzz fuzzy match (token_set_ratio ≥ 75)
+        3. Mistral AI fallback → INN → fuzzy match
 
 Age input: user types age in years → automatically mapped to age_stratum.
 
@@ -25,9 +28,11 @@ import numpy as np
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Pipeline import — run_signals.py is copied into /app by Dockerfile
+# Pipeline imports
+# run_signals.py and src/ are copied into /app by Dockerfile
 # ---------------------------------------------------------------------------
 from run_signals import run_pipeline
+from match_drug import resolve_drug_name
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -361,280 +366,6 @@ def load_drug_index() -> list[str]:
             pass
 
     return []
-
-
-# ============================================================================
-# Drug name resolution
-# ============================================================================
-
-# ============================================================================
-# Local brand-name → INN dictionary (offline, no API needed)
-# Covers common European/Italian brand names and alternative spellings.
-# Keys: UPPERCASE. Values: INN in UPPERCASE as found in FAERS.
-# ============================================================================
-_BRAND_TO_INN: dict[str, str] = {
-    # Paracetamol / Acetaminophen
-    "TACHIPIRINA": "PARACETAMOL",
-    "EFFERALGAN": "PARACETAMOL",
-    "PANADOL": "PARACETAMOL",
-    "TYLENOL": "ACETAMINOPHEN",
-    "ACET": "ACETAMINOPHEN",
-    "PARACETAMOLO": "PARACETAMOL",
-
-    # Ibuprofen
-    "BRUFEN": "IBUPROFEN",
-    "MOMENT": "IBUPROFEN",
-    "NUROFEN": "IBUPROFEN",
-    "ADVIL": "IBUPROFEN",
-    "IBUPROFENE": "IBUPROFEN",
-
-    # Aspirin
-    "ASPIRINA": "ASPIRIN",
-    "ASPIRINE": "ASPIRIN",
-    "CARDIOASPIRINA": "ASPIRIN",
-    "CARDIOASPIRIN": "ASPIRIN",
-    "BAYER": "ASPIRIN",
-
-    # Diclofenac
-    "VOLTAREN": "DICLOFENAC",
-    "VOLTAROL": "DICLOFENAC",
-    "DICLOREUM": "DICLOFENAC",
-    "DICLOFENACO": "DICLOFENAC",
-
-    # Ketoprofen
-    "KETOPROFENE": "KETOPROFEN",
-    "ORUDIS": "KETOPROFEN",
-    "FASTUM": "KETOPROFEN",
-
-    # Furosemide
-    "LASIX": "FUROSEMIDE",
-    "FUROSEMIDE": "FUROSEMIDE",
-
-    # Omeprazole / PPIs
-    "LOSEC": "OMEPRAZOLE",
-    "PRILOSEC": "OMEPRAZOLE",
-    "NEXIUM": "ESOMEPRAZOLE",
-    "PANTORC": "PANTOPRAZOLE",
-    "PARIET": "RABEPRAZOLE",
-
-    # Statins
-    "LIPITOR": "ATORVASTATIN",
-    "ZOCOR": "SIMVASTATIN",
-    "CRESTOR": "ROSUVASTATIN",
-    "PRAVACHOL": "PRAVASTATIN",
-
-    # Antihypertensives
-    "NORVASC": "AMLODIPINE",
-    "ZESTRIL": "LISINOPRIL",
-    "PRINIVIL": "LISINOPRIL",
-    "COVERSYL": "PERINDOPRIL",
-    "TRITACE": "RAMIPRIL",
-    "DIOVAN": "VALSARTAN",
-    "COZAAR": "LOSARTAN",
-    "TENORMIN": "ATENOLOL",
-    "CONCOR": "BISOPROLOL",
-
-    # Antibiotics
-    "AUGMENTIN": "AMOXICILLIN",
-    "ZIMOX": "AMOXICILLIN",
-    "ZITHROMAX": "AZITHROMYCIN",
-    "KLACID": "CLARITHROMYCIN",
-    "CIPROXIN": "CIPROFLOXACIN",
-    "FLAGYL": "METRONIDAZOLE",
-
-    # Antidiabetics
-    "GLUCOPHAGE": "METFORMIN",
-    "JANUVIA": "SITAGLIPTIN",
-    "LANTUS": "INSULIN GLARGINE",
-    "HUMALOG": "INSULIN LISPRO",
-    "NOVOLOG": "INSULIN ASPART",
-
-    # Anticoagulants
-    "COUMADIN": "WARFARIN",
-    "SINTROM": "ACENOCOUMAROL",
-    "PRADAXA": "DABIGATRAN",
-    "XARELTO": "RIVAROXABAN",
-    "ELIQUIS": "APIXABAN",
-
-    # Corticosteroids
-    "DELTACORTENE": "PREDNISONE",
-    "MEDROL": "METHYLPREDNISOLONE",
-    "BENTELAN": "BETAMETHASONE",
-
-    # Oncology (common in FAERS)
-    "HERCEPTIN": "TRASTUZUMAB",
-    "AVASTIN": "BEVACIZUMAB",
-    "GLEEVEC": "IMATINIB",
-    "GLIVEC": "IMATINIB",
-    "TAXOL": "PACLITAXEL",
-    "TAXOTERE": "DOCETAXEL",
-    "XELODA": "CAPECITABINE",
-    "ZOMETA": "ZOLEDRONIC ACID",
-    "NEUPOGEN": "FILGRASTIM",
-    "KEYTRUDA": "PEMBROLIZUMAB",
-    "OPDIVO": "NIVOLUMAB",
-
-    # Immunosuppressants
-    "PROGRAF": "TACROLIMUS",
-    "SANDIMMUN": "CICLOSPORIN",
-    "CELLCEPT": "MYCOPHENOLATE MOFETIL",
-
-    # Neurological / Psychiatric
-    "LYRICA": "PREGABALIN",
-    "NEURONTIN": "GABAPENTIN",
-    "ZOLOFT": "SERTRALINE",
-    "PROZAC": "FLUOXETINE",
-    "LEXAPRO": "ESCITALOPRAM",
-    "CIPRALEX": "ESCITALOPRAM",
-    "RISPERDAL": "RISPERIDONE",
-    "ZYPREXA": "OLANZAPINE",
-    "SEROQUEL": "QUETIAPINE",
-    "XANAX": "ALPRAZOLAM",
-    "VALIUM": "DIAZEPAM",
-    "TAVOR": "LORAZEPAM",
-    "RIVOTRIL": "CLONAZEPAM",
-    "DEPAKINE": "VALPROIC ACID",
-    "TEGRETOL": "CARBAMAZEPINE",
-    "KEPPRA": "LEVETIRACETAM",
-
-    # Respiratory
-    "VENTOLIN": "ALBUTEROL",
-    "SALBUTAMOLO": "ALBUTEROL",
-    "SYMBICORT": "BUDESONIDE",
-    "SERETIDE": "FLUTICASONE",
-    "SPIRIVA": "TIOTROPIUM",
-    "SINGULAR": "MONTELUKAST",
-
-    # Others frequently in FAERS
-    "ZITHROMAX": "AZITHROMYCIN",
-    "DIFLUCAN": "FLUCONAZOLE",
-    "TAMIFLU": "OSELTAMIVIR",
-    "PLAVIX": "CLOPIDOGREL",
-    "NEXPLANON": "ETONOGESTREL",
-}
-
-
-def _local_brand_lookup(query_upper: str) -> str | None:
-    """Direct lookup in _BRAND_TO_INN, then prefix scan for partial brand names."""
-    if query_upper in _BRAND_TO_INN:
-        return _BRAND_TO_INN[query_upper]
-    # Partial: if the query starts with a known brand (e.g. "TACHIPIRINA 500MG")
-    for brand, inn in _BRAND_TO_INN.items():
-        if query_upper.startswith(brand):
-            return inn
-    return None
-
-
-def _call_mistral_inn(user_input: str, api_key: str | None) -> tuple[str | None, str | None]:
-    """
-    Calls Mistral to resolve any drug name/brand/spelling to its English INN in UPPERCASE.
-
-    api_key: explicit key from UI, or None → falls back to MISTRAL_API_KEY env var.
-    Returns (inn, error_message). On success error_message is None.
-    Inlined here to avoid sys.path issues when Streamlit runs from /app.
-    """
-    import os as _os
-    import time as _time
-
-    resolved_key = api_key or _os.environ.get("MISTRAL_API_KEY")
-    if not resolved_key:
-        return None, None  # silently skip — no key available at all
-
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return None, "openai package not installed — Mistral fallback unavailable."
-
-    system_prompt = (
-        "You are a pharmacology expert. Your only job is to identify the English INN "
-        "(International Nonproprietary Name) of the drug the user refers to, regardless "
-        "of language, brand name, spelling, or abbreviation.\n\n"
-        "Return ONLY the English INN in UPPERCASE. No explanation, no punctuation, "
-        "no extra words. If you cannot identify the drug with confidence, return: NONE\n\n"
-        "Examples:\n"
-        "  brufen         → IBUPROFEN\n"
-        "  tachipirina    → ACETAMINOPHEN\n"
-        "  cardioaspirina → ASPIRIN\n"
-        "  voltaren       → DICLOFENAC\n"
-        "  lasix          → FUROSEMIDE\n"
-        "  moment         → IBUPROFEN\n"
-        "  ketoprofene    → KETOPROFEN\n"
-        "  aspirine       → ASPIRIN"
-    )
-
-    client = OpenAI(api_key=resolved_key, base_url="https://api.mistral.ai/v1")
-
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model="mistral-small-latest",
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_input.strip()},
-                ],
-            )
-            result = resp.choices[0].message.content.strip().upper()
-            if result == "NONE" or not result:
-                return None, None
-            return result, None
-        except Exception as e:
-            err = str(e)
-            if "429" in err and attempt < 2:
-                _time.sleep(2 ** attempt)
-                continue
-            return None, f"Mistral API error: {err}"
-
-    return None, "Mistral did not respond after 3 attempts."
-
-
-def resolve_drug_name(
-    user_input: str,
-    drug_index: list[str],
-    mistral_key: str | None = None,
-) -> tuple[str, str, float, str | None]:
-    """
-    Resolves a user-entered drug name to the exact drug_name in the Parquet index.
-
-    Returns
-    -------
-    (resolved_name, method, score, error)
-        method : "exact" | "fuzzy" | "mistral" | "passthrough"
-        score  : 0–100
-        error  : None or an error string to surface in the UI
-    """
-    from rapidfuzz import process, fuzz
-
-    query = user_input.strip().upper()
-
-    # 1. Exact match
-    if query in drug_index:
-        return query, "exact", 100.0, None
-
-    # 2. Fuzzy match via rapidfuzz
-    result = process.extractOne(query, drug_index, scorer=fuzz.token_set_ratio)
-    if result:
-        match, score, _ = result
-        if score >= 75:
-            return match, "fuzzy", float(score), None
-
-    # 3. Mistral fallback → get INN → then fuzzy-match INN on drug_index
-    #    _call_mistral_inn reads MISTRAL_API_KEY from env if mistral_key is None
-    inn, err = _call_mistral_inn(user_input, mistral_key)
-    if err:
-        return query, "passthrough", 0.0, err
-    if inn:
-        result_b = process.extractOne(inn, drug_index, scorer=fuzz.token_set_ratio)
-        if result_b and result_b[1] >= 75:
-            return result_b[0], "mistral", float(result_b[1]), None
-        # INN found but no match in dataset
-        return query, "passthrough", 0.0, (
-            f"Mistral resolved to **{inn}** but no match found in the dataset. "
-            f"Try using the drug's full English INN directly."
-        )
-
-    # 4. No reliable match
-    return query, "passthrough", 0.0, None
 
 
 # ============================================================================
@@ -1282,7 +1013,7 @@ if st.button("▶  Run analysis", type="primary"):
         st.warning(
             f"No reliable match found for '{drug_input_raw}'. "
             f"Proceeding with the raw input — if no pairs are found, "
-            f"try the English INN or active ingredient name."
+            f"try the English INN or active substance name."
         )
 
     # ── Resolve co-medication ────────────────────────────────────────────

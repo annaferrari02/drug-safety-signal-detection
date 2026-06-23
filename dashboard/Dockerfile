@@ -11,6 +11,7 @@ COPY vigipy/ ./vigipy/
 
 # Copia src/ per le funzioni condivise (es. text_to_sql, build_contingency_table)
 COPY src/ ./src/
+COPY src/match_drug.py .
 
 # Lista principi attivi per il fallback Mistral (usata da src/text_to_sql.py)
 # Path atteso: /app/principi_attivi.json = due livelli sopra /app/src/text_to_sql.py

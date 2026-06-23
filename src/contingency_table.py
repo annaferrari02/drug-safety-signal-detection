@@ -211,27 +211,34 @@ def _build_ct_index(
 
     query = f"""
     WITH
-    -- Intersezione in RAM: nessun I/O sul Parquet principale
+    -- 1. IDs di tutti i report che contengono il co-farmaco (Popolazione di Background dello Strato)
+    co_reports AS (
+        SELECT UNNEST(report_ids) AS report_id 
+        FROM '{ip}' 
+        WHERE drug_name = '{co_drug}'
+    ),
+    -- 2. Intersezione in RAM per calcolare il totale del target drug nello strato
     intersection AS (
         SELECT list_intersect(
             (SELECT report_ids FROM '{ip}' WHERE drug_name = '{target_drug}'),
             (SELECT report_ids FROM '{ip}' WHERE drug_name = '{co_drug}')
         ) AS valid_ids
     ),
-    valid_reports AS (
+    target_co_reports AS (
         SELECT UNNEST(valid_ids) AS report_id FROM intersection
     ),
+    -- 3. Totali complessivi dello strato co-medication
     totals AS (
-        SELECT COUNT(*) AS n FROM valid_reports
+        SELECT COUNT(*) AS n FROM co_reports
     ),
     drug_total AS (
-        SELECT COUNT(*) AS n_drug FROM valid_reports
+        SELECT COUNT(*) AS n_drug FROM target_co_reports
     ),
-    -- Scansione del Parquet solo sui report dell'intersezione
+    -- 4. Conteggio Cella A: Solo i report con entrambi i farmaci e il PT specifico
     target_pts AS (
         SELECT DISTINCT p.safetyreportid AS report_id, p.{pt_col} AS pt
         FROM '{sp}' p
-        JOIN valid_reports v ON p.safetyreportid = v.report_id
+        JOIN target_co_reports v ON p.safetyreportid = v.report_id
         WHERE p.drug_name = '{target_drug}'
           AND p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
     ),
@@ -239,10 +246,11 @@ def _build_ct_index(
         SELECT pt, COUNT(DISTINCT report_id) AS a
         FROM target_pts GROUP BY pt
     ),
+    -- 5. Marginali PT nello strato: Tutti i casi di quell'AE tra chi prende il co-farmaco
     pt_marginal AS (
         SELECT p.{pt_col} AS pt, COUNT(DISTINCT p.safetyreportid) AS n_pt
         FROM '{sp}' p
-        JOIN valid_reports v ON p.safetyreportid = v.report_id
+        JOIN co_reports v ON p.safetyreportid = v.report_id
         WHERE p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
         GROUP BY p.{pt_col}
     )
