@@ -224,13 +224,10 @@ def _build_ct_cubed(
     con.close()
     return result
 
-
-# ─── Route C: indice invertito per co-medication ────────────────────────────
-
+#route C 
 def _extract_comedication_drug(where_extra: str) -> str | None:
     m = re.search(r"drug_name\s*=\s*'([^']+)'", where_extra, re.IGNORECASE)
     return m.group(1).upper() if m else None
-
 
 def _build_ct_index(
         target_drug: str, pt_col: str, min_a: int,
@@ -245,58 +242,62 @@ def _build_ct_index(
     ip = str(_INDEX)
     sp = str(_SORTED_PARQUET)
 
-    # Verifica che il co-drug esista nell'indice
-    check = con.execute(f"""
-        SELECT COUNT(*) FROM '{ip}' WHERE drug_name = '{co_drug}'
-    """).fetchone()[0]
-    if check == 0:
-        con.close()
-        print(f"  [CT  ] '{co_drug}' non nell'indice — fallback Route D")
-        return _build_ct_full(target_drug, pt_col, min_a, where_extra, threads, memory)
+    # 1. VERIFICA PREVENTIVA IN RAM: Entrambi i farmaci esistono nell'indice?
+    # Questo evita di scansionare il Parquet principale se non ci sono dati.
+    check_status = con.execute(f"""
+        SELECT 
+            COUNT(CASE WHEN drug_name = '{target_drug}' THEN 1 END) AS has_target,
+            COUNT(CASE WHEN drug_name = '{co_drug}' THEN 1 END) AS has_co
+        FROM '{ip}' 
+        WHERE drug_name IN ('{target_drug}', '{co_drug}')
+    """).fetchone()
+    
+    has_target = check_status[0] > 0
+    has_co = check_status[1] > 0
 
+    if not has_target or not has_co:
+        missing = target_drug if not has_target else co_drug
+        print(f"  [WARN] '{missing}' NON presente nell'indice invertito (FAERS usa nomi USA, es: ACETAMINOPHEN).")
+        con.close()
+        # Ritorna immediatamente un DF vuoto con la struttura corretta in 0.01s
+        return pd.DataFrame(columns=['drug', 'pt', 'a', 'b', 'c', 'd', 'n'])
+
+    # 2. QUERY OTTIMIZZATA: Sostituito list_intersect con JOIN relazionale + subquery indexing
     query = f"""
     WITH
-    -- 1. IDs di tutti i report che contengono il co-farmaco (Popolazione di Background dello Strato)
-    co_reports AS (
-        SELECT UNNEST(report_ids) AS report_id 
-        FROM '{ip}' 
-        WHERE drug_name = '{co_drug}'
+    target_ids AS (
+        SELECT UNNEST(report_ids) AS report_id FROM '{ip}' WHERE drug_name = '{target_drug}'
     ),
-    -- 2. Intersezione in RAM per calcolare il totale del target drug nello strato
-    intersection AS (
-        SELECT list_intersect(
-            (SELECT report_ids FROM '{ip}' WHERE drug_name = '{target_drug}'),
-            (SELECT report_ids FROM '{ip}' WHERE drug_name = '{co_drug}')
-        ) AS valid_ids
+    co_ids AS (
+        SELECT UNNEST(report_ids) AS report_id FROM '{ip}' WHERE drug_name = '{co_drug}'
     ),
     target_co_reports AS (
-        SELECT UNNEST(valid_ids) AS report_id FROM intersection
+        SELECT t.report_id FROM target_ids t JOIN co_ids c ON t.report_id = c.report_id
     ),
-    -- 3. Totali complessivi dello strato co-medication
     totals AS (
-        SELECT COUNT(*) AS n FROM co_reports
+        SELECT COUNT(*) AS n FROM co_ids
     ),
     drug_total AS (
         SELECT COUNT(*) AS n_drug FROM target_co_reports
     ),
-    -- 4. Conteggio Cella A: Solo i report con entrambi i farmaci e il PT specifico
+    -- Cella A: Sfrutta Row-Group Pruning nativo su drug_name + l'indice dei report filtrati
     target_pts AS (
         SELECT DISTINCT p.safetyreportid AS report_id, p.{pt_col} AS pt
         FROM '{sp}' p
-        JOIN target_co_reports v ON p.safetyreportid = v.report_id
         WHERE p.drug_name = '{target_drug}'
+          AND p.safetyreportid IN (SELECT report_id FROM target_co_reports)
           AND p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
     ),
     pair_counts AS (
         SELECT pt, COUNT(DISTINCT report_id) AS a
         FROM target_pts GROUP BY pt
     ),
-    -- 5. Marginali PT nello strato: Tutti i casi di quell'AE tra chi prende il co-farmaco
+    -- Marginali PT dello strato co-medication: indicizzati tramite subquery per evitare il full-scan
     pt_marginal AS (
         SELECT p.{pt_col} AS pt, COUNT(DISTINCT p.safetyreportid) AS n_pt
         FROM '{sp}' p
-        JOIN co_reports v ON p.safetyreportid = v.report_id
-        WHERE p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
+        WHERE p.safetyreportid IN (SELECT report_id FROM co_ids)
+          AND p.{pt_col} IS NOT NULL AND p.{pt_col} != ''
         GROUP BY p.{pt_col}
     )
     SELECT

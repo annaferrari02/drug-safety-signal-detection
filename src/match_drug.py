@@ -34,12 +34,12 @@ from typing import Optional
 
 _BRAND_TO_INN: dict[str, str] = {
     # Paracetamol / Acetaminophen
-    "TACHIPIRINA":      "PARACETAMOL",
-    "EFFERALGAN":       "PARACETAMOL",
-    "PANADOL":          "PARACETAMOL",
+    "TACHIPIRINA":      "ACETAMINOPHEN",
+    "EFFERALGAN":       "ACETAMINOPHEN",
+    "PANADOL":          "ACETAMINOPHEN",
     "TYLENOL":          "ACETAMINOPHEN",
     "ACET":             "ACETAMINOPHEN",
-    "PARACETAMOLO":     "PARACETAMOL",
+    "PARACETAMOLO":     "ACETAMINOPHEN",
 
     # Ibuprofen
     "BRUFEN":           "IBUPROFEN",
