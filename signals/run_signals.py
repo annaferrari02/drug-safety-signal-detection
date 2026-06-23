@@ -91,6 +91,7 @@ def get_run_config() -> dict:
 
 def _build_ct(config: dict) -> pd.DataFrame:
     """Costruisce la contingency table via DuckDB. Il passo più pesante della pipeline."""
+    print(f"[DEBUG] where_extra repr: {repr(config.get('where_extra'))}", flush=True)
     return build_contingency_table(
         parquet_path=str(PARQUET_PATH),
         target_drug=config["target_drug"],

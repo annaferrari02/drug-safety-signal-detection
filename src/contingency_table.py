@@ -122,6 +122,22 @@ def _build_ct_global(
 
 # ─── Route B: cubo OLAP per filtri fissi ────────────────────────────────────
 
+def _build_cube_filter(where_extra: str) -> str:
+    """
+    Estrae dal where_extra solo i predicati su sex e age_stratum,
+    riscrivendoli in forma pulita per il cubo (niente newline, niente subquery).
+    Restituisce una stringa "WHERE ..." oppure "" se nessun predicato trovato.
+    """
+    parts = []
+    m_sex = re.search(r"sex\s*=\s*'([^']+)'", where_extra, re.IGNORECASE)
+    if m_sex:
+        parts.append(f"sex = '{m_sex.group(1)}'")
+    m_age = re.search(r"age_stratum\s*=\s*'([^']+)'", where_extra, re.IGNORECASE)
+    if m_age:
+        parts.append(f"age_stratum = '{m_age.group(1)}'")
+    return ("WHERE " + " AND ".join(parts)) if parts else ""
+
+
 def _build_ct_cubed(
         target_drug: str, pt_col: str, min_a: int,
         where_extra: str, threads: int, memory: str,
@@ -130,16 +146,42 @@ def _build_ct_cubed(
     sp = str(_SORTED_PARQUET)
     cp = str(_CUBED)
 
+    # Clausola WHERE sicura per il cubo: solo sex/age_stratum, senza newline
+    # né subquery che il cubo non conosce.
+    cube_where = _build_cube_filter(where_extra)
+
+    # n_stratum nel cubo è il totale per sex×age_stratum.
+    # Se filtriamo su entrambi → una sola riga per PT → SUM = valore corretto.
+    # Se filtriamo solo su age_stratum → due righe per PT (male + female)
+    #   → SUM(n_pt_stratum) aggrega correttamente i PT counts
+    #   → SUM(DISTINCT n_stratum) sommerebbe valori distinti, ma n_stratum
+    #     varia per sesso, quindi serve SUM dei totali di strato distinti.
+    # Soluzione: calcoliamo n_stratum_total separatamente come somma dei
+    # totali unici per ciascuna combinazione sex×age presente nel filtro.
+
     query = f"""
     WITH
-    -- Marginali dello strato dal cubo (~100ms, push-down sui row group)
+    -- Marginali PT aggregati sullo strato richiesto
+    -- SUM per gestire il caso "solo age_stratum" (righe male+female sommate)
     stratum_marginals AS (
         SELECT
-            reaction_pt      AS pt,
-            n_pt_stratum,
-            n_stratum
+            reaction_pt             AS pt,
+            SUM(n_pt_stratum)       AS n_pt_stratum
         FROM '{cp}'
-        WHERE {where_extra}
+        {cube_where}
+        GROUP BY reaction_pt
+    ),
+    -- Totale report nello strato: somma degli n_stratum distinti per sex×age.
+    -- MAX(n_stratum) per ogni combinazione sex×age_stratum, poi somma.
+    -- Questo funziona sia con filtro su entrambi (1 combo) sia solo su age (2 combo).
+    stratum_total AS (
+        SELECT SUM(max_n) AS n_stratum
+        FROM (
+            SELECT sex, age_stratum, MAX(n_stratum) AS max_n
+            FROM '{cp}'
+            {cube_where}
+            GROUP BY sex, age_stratum
+        )
     ),
     -- Solo le righe del target drug nello strato (row group pruning)
     drug_pt_pairs AS (
@@ -159,20 +201,21 @@ def _build_ct_cubed(
         FROM drug_pt_pairs
     )
     SELECT
-        '{target_drug}'                                        AS drug,
-        pc.pt                                                  AS pt,
-        pc.a                                                   AS a,
-        (dt.n_drug       - pc.a)                               AS b,
-        (sm.n_pt_stratum - pc.a)                               AS c,
-        (sm.n_stratum - dt.n_drug - sm.n_pt_stratum + pc.a)    AS d,
-        sm.n_stratum                                           AS n
+        '{target_drug}'                                          AS drug,
+        pc.pt                                                    AS pt,
+        pc.a                                                     AS a,
+        (dt.n_drug         - pc.a)                               AS b,
+        (sm.n_pt_stratum   - pc.a)                               AS c,
+        (st.n_stratum - dt.n_drug - sm.n_pt_stratum + pc.a)      AS d,
+        st.n_stratum                                             AS n
     FROM pair_counts       pc
     JOIN stratum_marginals sm ON pc.pt = sm.pt
     CROSS JOIN drug_total  dt
+    CROSS JOIN stratum_total st
     WHERE pc.a >= {min_a}
-      AND (dt.n_drug       - pc.a)                           >= 0
-      AND (sm.n_pt_stratum - pc.a)                           >= 0
-      AND (sm.n_stratum - dt.n_drug - sm.n_pt_stratum + pc.a) >= 0
+      AND (dt.n_drug         - pc.a)                           >= 0
+      AND (sm.n_pt_stratum   - pc.a)                           >= 0
+      AND (st.n_stratum - dt.n_drug - sm.n_pt_stratum + pc.a)  >= 0
     ORDER BY pc.a DESC
     """
     result = con.execute(query).df()
@@ -365,6 +408,11 @@ def build_contingency_table(
     Fallback globale: se faers_sorted o marginals_global non esistono,
     usa parquet_path con full scan (comportamento pre-ottimizzazione).
     """
+    # Normalizza where_extra: collassa newline e spazi multipli.
+    # Difende da stringhe con \n letterali che spezzano il parser SQL di DuckDB.
+    if where_extra:
+        where_extra = " ".join(where_extra.split())
+
     # Fallback se i file ottimizzati non esistono
     if not _SORTED_PARQUET.exists() or not _MARGINALS.exists():
         print(f"  [CT  ] File ottimizzati non trovati — fallback su {parquet_path}")

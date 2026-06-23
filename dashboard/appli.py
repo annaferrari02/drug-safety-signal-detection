@@ -83,14 +83,14 @@ st.markdown("""
 
     /* ── Page title ── */
     .page-title {
-        font-size: 22px;
+        font-size: 30px;
         font-weight: 700;
         color: var(--text);
         letter-spacing: -0.02em;
         margin-bottom: 2px;
     }
     .page-subtitle {
-        font-size: 13px;
+        font-size: 22px;
         color: var(--text-3);
         margin-bottom: 28px;
         font-weight: 400;
@@ -175,13 +175,50 @@ st.markdown("""
         font-family: 'JetBrains Mono', monospace;
     }
 
-    /* Icon button — clickable */
-    .icon-cell {
+    /* Icon with hover tooltip */
+    .icon-wrap {
+        position: relative;
         font-size: 17px;
         min-width: 28px;
         text-align: center;
-        cursor: pointer;
+        cursor: default;
         user-select: none;
+        display: inline-block;
+    }
+    .icon-wrap .tip {
+        visibility: hidden;
+        opacity: 0;
+        position: absolute;
+        bottom: calc(100% + 8px);
+        left: 50%;
+        transform: translateX(-50%);
+        background: #1F2937;
+        color: #F9FAFB;
+        font-size: 11px;
+        font-family: 'Inter', sans-serif;
+        font-weight: 400;
+        line-height: 1.45;
+        padding: 6px 10px;
+        border-radius: 6px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.18);
+        z-index: 9999;
+        white-space: normal;
+        max-width: 180px;
+        text-align: left;
+        transition: opacity 0.15s;
+        pointer-events: none;
+    }
+    .icon-wrap .tip::after {
+        content: '';
+        position: absolute;
+        top: 100%; left: 50%;
+        transform: translateX(-50%);
+        border: 5px solid transparent;
+        border-top-color: #1F2937;
+    }
+    .icon-wrap:hover .tip {
+        visibility: visible;
+        opacity: 1;
     }
 
     /* Chip for drug match */
@@ -287,7 +324,7 @@ st.markdown("""
         border: 1px solid var(--accent-mid);
         border-radius: var(--radius);
         padding: 10px 14px;
-        font-size: 12px;
+        font-size: 10px
         color: var(--accent);
     }
 </style>
@@ -441,6 +478,17 @@ def count_unknown_age_excluded() -> int | None:
         return None
 
 
+def count_total_reports() -> int | None:
+    try:
+        con = duckdb.connect()
+        result = con.execute(
+            f"SELECT COUNT(DISTINCT safetyreportid) FROM '{PARQUET_PATH}'"
+        ).fetchone()
+        return result[0] if result else None
+    except Exception:
+        return None
+
+
 # ============================================================================
 # Confidence score
 # ============================================================================
@@ -554,10 +602,18 @@ def render_ae_list(
 
     display_df = ranked_df if limit is None else ranked_df.head(limit)
 
-    weber_emoji, weber_css, weber_label = WEBER_COLORS.get(
+    weber_emoji, _, _ = WEBER_COLORS.get(
         (weber_risk or "").upper(),
-        ("⬜", "popup-weber-low", "N/A"),
+        ("⬜", "", "N/A"),
     )
+
+    # Tooltip texts
+    WEBER_TIP = {
+        "LOW":    "🟢 Low bias risk \u2014 stable reporting over time.",
+        "MEDIUM": "🟡 Moderate bias risk \u2014 early-phase spike detected. Interpret with caution.",
+        "HIGH":   "🔴 High bias risk \u2014 reports clustered post-approval. May reflect notoriety, not pharmacology.",
+    }
+    weber_tip = WEBER_TIP.get((weber_risk or "").upper(), "Weber check not run.")
 
     for idx, row in display_df.iterrows():
         ae       = row["ae_name"]
@@ -583,7 +639,12 @@ def render_ae_list(
           <div class="conf-label">{score}/100</div>
         </div>"""
 
-        fda_icon   = "✅" if is_known else "🔍"
+        fda_icon = "✅" if is_known else "🔍"
+        fda_tip  = (
+            "✅ In FDA label \u2014 known adverse event."
+            if is_known else
+            "🔍 Not in FDA label \u2014 potentially new signal."
+        )
 
         card_html = f"""
         <div class="signal-card">
@@ -593,72 +654,17 @@ def render_ae_list(
             <div>{pills_html}</div>
           </div>
           {bar_html}
-          <div class="icon-cell" title="FDA validation status">{fda_icon}</div>
-          <div class="icon-cell" title="Weber effect risk">{weber_emoji}</div>
+          <div class="icon-wrap">
+            {fda_icon}
+            <div class="tip">{fda_tip}</div>
+          </div>
+          <div class="icon-wrap">
+            {weber_emoji}
+            <div class="tip">{weber_tip}</div>
+          </div>
         </div>"""
 
         st.markdown(card_html, unsafe_allow_html=True)
-
-        # ── Expandable popup for icons ────────────────────────────────────
-        with st.expander("Details", expanded=False):
-            col_fda, col_weber = st.columns(2)
-
-            with col_fda:
-                st.markdown("**FDA Label Validation**")
-                if is_known:
-                    st.markdown("""
-                    <div class="popup-known">
-                      <strong>✅ Scientifically validated signal</strong><br><br>
-                      This adverse event is listed in the official FDA drug label.
-                      Its association with this drug is recognised by regulatory
-                      literature and supported by clinical evidence.
-                    </div>""", unsafe_allow_html=True)
-                elif val_st == "POTENTIALLY_NEW":
-                    st.markdown("""
-                    <div class="popup-new">
-                      <strong>🔍 Potentially new signal</strong><br><br>
-                      This adverse event does <em>not</em> appear in the FDA label.
-                      The association is statistically detected but lacks established
-                      regulatory support. Further clinical investigation is required.
-                    </div>""", unsafe_allow_html=True)
-                else:
-                    st.caption("FDA validation data not available for this event.")
-
-            with col_weber:
-                st.markdown("**Weber Effect — Bias Risk**")
-                if weber_risk:
-                    weber_text = {
-                        "LOW": (
-                            "Reports are distributed evenly over time with no early "
-                            "post-approval spike. The signal is considered statistically "
-                            "reliable and unlikely to be driven by reporting novelty."
-                        ),
-                        "MEDIUM": (
-                            "A moderate concentration of reports in the early "
-                            "post-approval period is detected. The signal may be "
-                            "partially inflated. Interpret with caution."
-                        ),
-                        "HIGH": (
-                            "Reports are heavily clustered in the first years after "
-                            "approval. This pattern strongly suggests a notoriety bias, "
-                            "where initial media attention drives over-reporting. "
-                            "The signal may not reflect a real pharmacological risk."
-                        ),
-                    }.get((weber_risk or "").upper(), "Weber data not available.")
-
-                    level_label = {
-                        "LOW": "Low risk of bias",
-                        "MEDIUM": "Moderate risk of bias",
-                        "HIGH": "High risk of bias",
-                    }.get((weber_risk or "").upper(), "")
-
-                    st.markdown(f"""
-                    <div class="{weber_css}">
-                      <strong>{weber_emoji} {level_label}</strong><br><br>
-                      {weber_text}
-                    </div>""", unsafe_allow_html=True)
-                else:
-                    st.caption("Weber check was not run for this analysis.")
 
 
 # ============================================================================
@@ -700,11 +706,11 @@ def run_and_display(
 
     if age_stratum:
         n_unknown = count_unknown_age_excluded()
-        if n_unknown:
+        n_total = count_total_reports()
+        if n_unknown and n_total:
             st.markdown(
                 f'<div class="info-box">Age filter active (<strong>{age_stratum}</strong>): '
-                f'<strong>{n_unknown:,}</strong> reports with no age recorded are excluded '
-                f'from both the target group and the background.</div>',
+                f'<strong>{n_total - n_unknown:,}</strong> reports included for analysis. </div>',
                 unsafe_allow_html=True,
             )
             st.write("")
@@ -728,7 +734,7 @@ def run_and_display(
         cached_ct = st.session_state.get("_ct_cache")
         if cached_ct is not None:
             st.caption(
-                f"⚡ Contingency table loaded from cache ({len(cached_ct)} pairs) "
+                f"Contingency table loaded from cache ({len(cached_ct)} pairs) "
                 f"— only algorithms are re-run."
             )
 
@@ -862,7 +868,7 @@ st.markdown(
 # INPUT PARAMETERS
 # ============================================================================
 
-st.markdown('<div class="section-header">Analysis Parameters</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-header">Insert Parameters</div>', unsafe_allow_html=True)
 
 drug_index = load_drug_index()
 
@@ -890,7 +896,7 @@ with col2:
 with col3:
     age_input_raw = st.text_input(
         "Age",
-        placeholder="e.g. 45 · adult · geriatric",
+        placeholder="Insert age",
         key="age_input",
     )
 
@@ -998,14 +1004,14 @@ if st.button("▶  Run analysis", type="primary"):
 
     if drug_method == "fuzzy":
         st.markdown(
-            f'<span class="match-chip">🔍 "{drug_input_raw}" → '
+            f'<span class="match-chip"> Found corresponding ACTIVE SUBSTANCE "{drug_input_raw}" → '
             f'<strong>{resolved_drug}</strong> '
             f'(fuzzy match · {drug_score:.0f}/100)</span>',
             unsafe_allow_html=True,
         )
     elif drug_method == "mistral":
         st.markdown(
-            f'<span class="match-chip">🤖 "{drug_input_raw}" → '
+            f'<span class="match-chip"> Found corresponding ACTIVE SUBSTANCE: "{drug_input_raw}" → '
             f'<strong>{resolved_drug}</strong> (via Mistral AI)</span>',
             unsafe_allow_html=True,
         )
@@ -1026,13 +1032,13 @@ if st.button("▶  Run analysis", type="primary"):
             st.warning(f"Co-medication resolution: {comed_err}")
         if comed_method == "fuzzy" and comed_score < 100:
             st.markdown(
-                f'<span class="match-chip">🔍 Co-med: "{comed_input_raw}" → '
+                f'<span class="match-chip">Found Co-med ACTIVE SUBSTANCE: "{comed_input_raw} " → '
                 f'<strong>{resolved_comed}</strong> ({comed_score:.0f}/100)</span>',
                 unsafe_allow_html=True,
             )
         elif comed_method == "mistral":
             st.markdown(
-                f'<span class="match-chip">🤖 Co-med: "{comed_input_raw}" → '
+                f'<span class="match-chip"> Found Co-med ACTIVE SUBSTANCE: "{comed_input_raw}" → '
                 f'<strong>{resolved_comed}</strong> (via Mistral AI)</span>',
                 unsafe_allow_html=True,
             )
@@ -1047,13 +1053,13 @@ if st.button("▶  Run analysis", type="primary"):
     age_stratum = age_to_stratum(age_input_raw)
     if age_input_raw.strip() and age_stratum:
         st.markdown(
-            f'<span class="match-chip">👤 Age "{age_input_raw}" → '
+            f'<span class="match-chip">Age "{age_input_raw}" → '
             f'<strong>{age_stratum}</strong></span>',
             unsafe_allow_html=True,
         )
     elif age_input_raw.strip() and not age_stratum:
         st.warning(
-            f"Age input '{age_input_raw}' not recognised — no age filter applied."
+            f"Age input '{age_input_raw}' not recognised —> no age filter applied."
         )
 
     # ── Build where clause ───────────────────────────────────────────────
