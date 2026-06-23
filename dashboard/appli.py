@@ -26,6 +26,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import re 
 
 # ---------------------------------------------------------------------------
 # Pipeline imports
@@ -449,19 +450,31 @@ def build_where_extra(
     clauses = []
 
     if sex and sex.lower() not in ("all", ""):
-        clauses.append(f"Sex = '{sex.strip().lower()}'")
+        clauses.append(f"sex = '{sex.strip().lower()}'")        
 
     if age_stratum:
-        clauses.append(f"Age group = '{age_stratum}'")
+        clauses.append(f"age_stratum = '{age_stratum}'")        
 
     if comedication_resolved:
-        clauses.append(
-            f"""Comedication Active Substance = '{comedication_resolved}'
-            )"""
-        )
+        clauses.append(f"drug_name = '{comedication_resolved}'")
+        
 
     return " AND ".join(clauses) if clauses else None
 
+def format_where_label(where_extra: str | None) -> str:
+    if not where_extra:
+        return "None"
+    parts = []
+    m_sex = re.search(r"sex\s*=\s*'([^']+)'", where_extra, re.IGNORECASE)
+    if m_sex:
+        parts.append(f"Sex: {m_sex.group(1).capitalize()}")
+    m_age = re.search(r"age_stratum\s*=\s*'([^']+)'", where_extra, re.IGNORECASE)
+    if m_age:
+        parts.append(f"Age: {m_age.group(1).capitalize()}")
+    m_drug = re.search(r"drug_name\s*=\s*'([^']+)'", where_extra, re.IGNORECASE)
+    if m_drug:
+        parts.append(f"Co-med: {m_drug.group(1)}")
+    return "<br>".join(parts) if parts else where_extra
 
 def count_unknown_age_excluded() -> int | None:
     try:
@@ -794,7 +807,7 @@ def run_and_display(
     _metric(m1, config["target_drug"], "Drug")
     _metric(m2, f"{len(ct):,}", "CT Pairs")
     _metric(m3, summary.get("total_elapsed_s", "—"), "Time (s)")
-    _metric(m4, config["where_extra"] or "None", "Filter")
+    _metric(m4, format_where_label(config["where_extra"]), "Filter")
 
     if summary.get("algorithm_results"):
         st.write("")

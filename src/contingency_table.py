@@ -59,13 +59,15 @@ def _detect_route(where_extra: str | None) -> str:
     if where_extra is None:
         return "global"
     we = where_extra.strip()
+    # Route C: vecchio pattern subquery O nuovo pattern semplice
     if re.search(r"safetyreportid\s+IN\s*\(", we, re.IGNORECASE):
+        return "index"
+    if re.search(r"\bdrug_name\s*=\s*'", we, re.IGNORECASE):
         return "index"
     mentioned = {c.lower() for c in re.findall(r"\b([a-z_]+)\b\s*(?:=|IN\b|LIKE\b)", we, re.IGNORECASE)}
     if mentioned and mentioned.issubset(_FIXED_COLS):
         return "cubed"
     return "full"
-
 
 # ─── Route A: sorted + marginals_global (fast path) ─────────────────────────
 
