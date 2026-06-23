@@ -449,17 +449,14 @@ def build_where_extra(
     clauses = []
 
     if sex and sex.lower() not in ("all", ""):
-        clauses.append(f"sex = '{sex.strip().lower()}'")
+        clauses.append(f"Sex = '{sex.strip().lower()}'")
 
     if age_stratum:
-        clauses.append(f"age_stratum = '{age_stratum}'")
+        clauses.append(f"Age group = '{age_stratum}'")
 
     if comedication_resolved:
         clauses.append(
-            f"""safetyreportid IN (
-                SELECT DISTINCT safetyreportid
-                FROM '{PARQUET_PATH}'
-                WHERE drug_name = '{comedication_resolved}'
+            f"""Comedication Active Substance = '{comedication_resolved}'
             )"""
         )
 
