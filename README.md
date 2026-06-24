@@ -82,7 +82,110 @@ The system is a Dockerized microservice pipeline with three main layers:
 │  Weber risk indicators · Stratification filters              │
 └──────────────────────────────────────────────────────────────┘
 ```
+```mermaid
+%%{init: {"theme": "dark", "themeVariables": {"background": "#0d1117", "primaryColor": "#161b22", "primaryTextColor": "#e6edf3", "primaryBorderColor": "#30363d", "lineColor": "#58a6ff", "clusterBkg": "#161b22", "clusterBorder": "#30363d", "fontFamily": "ui-sans-serif, system-ui, sans-serif", "fontSize": "13px"}}}%%
 
+flowchart LR
+
+    FDA(["`**FDA FAERS**\nopenFDA API`"])
+    HF(["`**Hugging Face**\ndrug-safety-faers`"])
+    OPENFDA(["`openFDA\nlabel + drugsatfda`"])
+    MISTRAL(["`Mistral AI\nINN extraction`"])
+
+    subgraph ING["INGESTION"]
+        direction TB
+        DL["`run_download.py\nQuarterly ZIPs`"]
+        FL["`run_flatten.py\nijson streaming`"]
+        DD["`Deduplication\nDuckDB`"]
+        PR["`run_prepare.py\nPre-aggregation`"]
+        DL --> FL --> DD --> PR
+    end
+
+    subgraph LAKE["DATA LAKE  ·  data/  ·  shared volume"]
+        direction TB
+        P1["`**faers_flat_deduped.parquet**\n741 M rows · 2 GB · 1986–2026`"]
+        P2["`faers_sorted.parquet\nrow-group pruning`"]
+        P3["`marginals_global.parquet\n17,756 rows`"]
+        P4["`marginals_cubed.parquet\nsex × age × PT`"]
+        P5["`drug_inverted_index.parquet\n155,789 drugs`"]
+    end
+
+    subgraph PIPE["SIGNAL PIPELINE"]
+        direction TB
+
+        subgraph RES["Drug name resolution  ·  match_drug.py"]
+            direction LR
+            R0["`Brand→INN\noffline`"] -->|miss| R1["`Exact\nmatch`"] -->|miss| R2["`rapidfuzz\n≥75/100`"] -->|miss| R3["`Mistral AI\nfallback`"]
+        end
+
+        subgraph CT["Contingency table  ·  contingency_table.py"]
+            direction LR
+            RA["`Route A\nGlobal · 2–5s`"]
+            RB["`Route B\nOLAP · <1s`"]
+            RC["`Route C\nco-med · 5–8s`"]
+            RD["`Route D\nfull scan`"]
+        end
+
+        TABLE["`**2×2 contingency table**\nall drug–AE pairs`"]
+
+        subgraph ALG["Algorithms  ·  signals.py  ·  ThreadPoolExecutor × 4"]
+            direction LR
+            PRR["`**PRR**\nFDR<0.05`"]
+            ROR["`**ROR**\nFDR<0.05`"]
+            BCPNN["`**BCPNN**\nIC025>0`"]
+            MGPS["`**MGPS**\nEB05≥2`"]
+        end
+
+        UNION["`Union of positive signals`"]
+
+        subgraph VAL["Validation  ·  parallel I/O"]
+            direction LR
+            VL["`validate_label.py\nKNOWN / NEW`"]
+            WB["`weber_check.py\nLOW / MOD / HIGH`"]
+        end
+
+        SCORE["`**Confidence score**\n30% concordance · 40% strength · 30% rate`"]
+
+        RES --> CT --> TABLE --> ALG --> UNION --> VAL --> SCORE
+    end
+
+    subgraph DASH["DASHBOARD  ·  Streamlit  ·  :8501"]
+        direction TB
+        UI["`Drug input · filters · parameters`"]
+        CACHE["`CT cache\nst.session_state`"]
+        AE["`AE cards · score · FDA ✅ · Weber ⚠`"]
+        UI --> CACHE --> AE
+    end
+
+    FDA -->|quarterly ZIPs| DL
+    HF -->|pre-computed Parquets| LAKE
+    DD --> P1
+    PR --> P2 & P3 & P4 & P5
+    P2 --> RA & RD
+    P3 --> RA
+    P4 --> RB
+    P5 --> RC & RES
+    SCORE --> UI
+    VL <-->|REST + cache| OPENFDA
+    WB <-->|REST + cache| OPENFDA
+    R3 <-->|API| MISTRAL
+
+    classDef source   fill:#1c2433,stroke:#58a6ff,stroke-width:1.5px,color:#79c0ff
+    classDef parquet  fill:#161b22,stroke:#388bfd,stroke-width:1px,color:#cdd9e5
+    classDef route    fill:#161b22,stroke:#3fb950,stroke-width:1px,color:#7ee787
+    classDef algo     fill:#1a1f2e,stroke:#bc8cff,stroke-width:1.5px,color:#d2a8ff
+    classDef validate fill:#161b22,stroke:#d29922,stroke-width:1px,color:#e3b341
+    classDef key      fill:#1f2937,stroke:#58a6ff,stroke-width:2px,color:#e6edf3
+    classDef extapi   fill:#1c2433,stroke:#f78166,stroke-width:1px,color:#ffa198
+
+    class FDA,HF source
+    class P1,P2,P3,P4,P5 parquet
+    class RA,RB,RC,RD route
+    class PRR,ROR,BCPNN,MGPS algo
+    class VL,WB validate
+    class TABLE,SCORE,UNION key
+    class OPENFDA,MISTRAL extapi
+```
 ### Contingency Table Routing
 
 The most performance-critical component is the contingency table builder, which implements four query routes selected automatically based on the requested stratification:
