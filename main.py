@@ -198,19 +198,27 @@ def download_data() -> None:
         url = hf_url(filename)
         info(f"Downloading {filename} …")
 
-        try:
-            response = requests.get(url, stream=True, timeout=60)
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                abort(
-                    f"{filename} not found at {url}\n"
-                    f"        Make sure you have uploaded the files to:\n"
-                    f"        https://huggingface.co/datasets/{HF_REPO_ID}"
-                )
-            abort(f"HTTP error downloading {filename}: {e}")
-        except requests.exceptions.ConnectionError:
-            abort("Cannot reach Hugging Face. Check your internet connection.")
+        for attempt in range(3):
+            try:
+                response = requests.get(url, stream=True, timeout=(10, 300))
+                response.raise_for_status()
+                break
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    abort(
+                        f"{filename} not found at {url}\n"
+                        f"        Make sure you have uploaded the files to:\n"
+                        f"        https://huggingface.co/datasets/{HF_REPO_ID}"
+                    )
+                abort(f"HTTP error downloading {filename}: {e}")
+            except requests.exceptions.Timeout:
+                if attempt < 2:
+                    warn(f"Timeout on {filename}, retry {attempt+1}/3...")
+                    time.sleep(5)
+                else:
+                    abort(f"Download of {filename} failed after 3 attempts. Check your internet connection.")
+            except requests.exceptions.ConnectionError:
+                abort("Cannot reach Hugging Face. Check your internet connection.")
 
         total_bytes = int(response.headers.get("content-length", 0))
         chunk_size  = 8 * 1024 * 1024  # 8 MB chunks
