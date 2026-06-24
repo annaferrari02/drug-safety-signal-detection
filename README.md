@@ -199,6 +199,22 @@ The most performance-critical component is the contingency table builder, which 
 | **D — Full scan** | Any other filter | `faers_sorted.parquet` only | 60–90 s |
 
 Route selection is automatic via regex matching on the `where_extra` SQL fragment. Routes A and B exploit pre-aggregated Parquet files; Route C uses a list-intersection index to avoid scanning all 741M rows.
+### Contingency Table Routing Detail
+ 
+```mermaid
+flowchart LR
+    INPUT["where_extra\n(SQL fragment)"] --> DET{"_detect_route()"}
+ 
+    DET -->|"None"| A["Route A · Global\nfaers_sorted + marginals_global\n~2–5 s"]
+    DET -->|"sex= / age_stratum="| B["Route B · OLAP Cube\nmarginals_cubed\n< 1 s"]
+    DET -->|"drug_name= present"| C["Route C · Inverted Index\nlist_intersect() in DuckDB\n5–8 s"]
+    DET -->|"other filters"| D["Route D · Full scan\nfaers_sorted with WHERE\n60–90 s"]
+ 
+    A --> CT[/"2×2 contingency table\nall drug–AE pairs"/]
+    B --> CT
+    C --> CT
+    D --> CT
+```
 
 ---
 
@@ -267,23 +283,6 @@ For a given drug, the engine builds a 2×2 table for every drug–AE pair:
 | **Drug absent** | c | d |
 
 All four values are computed in a single DuckDB query using CTEs, entirely within the Parquet file. No Python round-trips; all joins stay native in DuckDB.
-
-## Contingency Table Routing Detail
- 
-```mermaid
-flowchart LR
-    INPUT["where_extra\n(SQL fragment)"] --> DET{"_detect_route()"}
- 
-    DET -->|"None"| A["Route A · Global\nfaers_sorted + marginals_global\n~2–5 s"]
-    DET -->|"sex= / age_stratum="| B["Route B · OLAP Cube\nmarginals_cubed\n< 1 s"]
-    DET -->|"drug_name= present"| C["Route C · Inverted Index\nlist_intersect() in DuckDB\n5–8 s"]
-    DET -->|"other filters"| D["Route D · Full scan\nfaers_sorted with WHERE\n60–90 s"]
- 
-    A --> CT[/"2×2 contingency table\nall drug–AE pairs"/]
-    B --> CT
-    C --> CT
-    D --> CT
-```
  
 ---
 
