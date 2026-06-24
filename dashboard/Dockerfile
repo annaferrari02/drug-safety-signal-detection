@@ -13,9 +13,6 @@ COPY vigipy/ ./vigipy/
 COPY src/ ./src/
 COPY src/match_drug.py .
 
-# Lista principi attivi per il fallback Mistral (usata da src/text_to_sql.py)
-# Path atteso: /app/principi_attivi.json = due livelli sopra /app/src/text_to_sql.py
-COPY principi_attivi.json .
 
 # Copia run_signals.py nella stessa posizione (root /app) usata dal
 # container 'signals', cosi che Path(__file__).resolve().parent risolva
