@@ -368,7 +368,7 @@ python main.py
 4. Starts the dashboard container
 5. Opens the browser at `http://localhost:8501`
 
-### Optional: Mistral API key (drug name resolution fallback)
+### Mistral API key (drug name resolution fallback)
 
 Create a `.env` file in the project root:
 
@@ -376,7 +376,7 @@ Create a `.env` file in the project root:
 MISTRAL_API_KEY=your_key_here
 ```
 
-Without this key, drug name resolution uses the offline dictionary and fuzzy matching (steps 0–2). Mistral is only invoked when these fail.
+Without this key, drug name resolution uses the offline dictionary and fuzzy matching (steps 0–2). Moreover, there will be no common-terms explanation of adverse events.
 
 ### Optional: Rebuild from raw FAERS data
 
@@ -445,9 +445,6 @@ python run_prepare.py    # builds marginals and inverted index
 ### Potential Improvements
 
 - **Confounder adjustment**: implement propensity score stratification or logistic regression to control for indication
-- **Temporal analysis**: extend Weber check to full time-series trend modeling (CUSUM, SPRT)
-- **Multi-drug queries**: extend the pipeline to compare signals across a drug class
-- **Real-time updates**: connect to the FAERS quarterly update endpoint and incrementally update the Parquet files (`ingestion/update_ingestion.py` provides this infrastructure)
 - **MedDRA hierarchy**: aggregate signals at SOC (System Organ Class) level in addition to PT (Preferred Term)
 - **Kubernetes deployment**: dynamic scaling for multi-user academic or institutional use
 
