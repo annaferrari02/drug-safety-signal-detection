@@ -1,5 +1,4 @@
-#Drug Safety signal detection from adverse event 
-# Drug Safety Signal Detection
+ # Drug Safety Signal Detection
 
 [![Python](https://img.shields.io/badge/python-3.13-blue)](https://www.python.org/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-1.x-yellow)](https://duckdb.org/)
