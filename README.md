@@ -268,7 +268,7 @@ For a given drug, the engine builds a 2×2 table for every drug–AE pair:
 
 All four values are computed in a single DuckDB query using CTEs, entirely within the Parquet file. No Python round-trips; all joins stay native in DuckDB.
 
-## Contingency Table Routing Detail
+### Contingency Table Routing Detail
  
 ```mermaid
 flowchart LR
