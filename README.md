@@ -84,7 +84,7 @@ The system is a Dockerized microservice pipeline with three main layers:
 ```mermaid
 %%{init: {"theme": "dark", "themeVariables": {"background": "#0d1117", "primaryColor": "#161b22", "primaryTextColor": "#e6edf3", "primaryBorderColor": "#30363d", "lineColor": "#58a6ff", "clusterBkg": "#161b22", "clusterBorder": "#30363d", "fontFamily": "ui-sans-serif, system-ui, sans-serif", "fontSize": "13px"}}}%%
 
-flowchart LR
+flowchart TD
 
     FDA(["`**FDA FAERS**\nopenFDA API`"])
     HF(["`**Hugging Face**\ndrug-safety-faers`"])
@@ -92,7 +92,7 @@ flowchart LR
     MISTRAL(["`Mistral AI\nINN extraction`"])
 
     subgraph ING["INGESTION"]
-        direction TB
+        direction LR
         DL["`run_download.py\nQuarterly ZIPs`"]
         FL["`run_flatten.py\nijson streaming`"]
         DD["`Deduplication\nDuckDB`"]
@@ -101,7 +101,7 @@ flowchart LR
     end
 
     subgraph LAKE["DATA LAKE  ·  data/  ·  shared volume"]
-        direction TB
+        direction LR
         P1["`**faers_flat_deduped.parquet**\n741 M rows · 2 GB · 1986–2026`"]
         P2["`faers_sorted.parquet\nrow-group pruning`"]
         P3["`marginals_global.parquet\n17,756 rows`"]
@@ -149,22 +149,24 @@ flowchart LR
     end
 
     subgraph DASH["DASHBOARD  ·  Streamlit  ·  :8501"]
-        direction TB
+        direction LR
         UI["`Drug input · filters · parameters`"]
         CACHE["`CT cache\nst.session_state`"]
         AE["`AE cards · score · FDA ✅ · Weber ⚠`"]
         UI --> CACHE --> AE
     end
 
-    FDA -->|quarterly ZIPs| DL
+    FDA -->|quarterly ZIPs| ING
     HF -->|pre-computed Parquets| LAKE
+    ING --> LAKE
     DD --> P1
     PR --> P2 & P3 & P4 & P5
     P2 --> RA & RD
     P3 --> RA
     P4 --> RB
     P5 --> RC & RES
-    SCORE --> UI
+    LAKE --> PIPE
+    SCORE --> DASH
     VL <-->|REST + cache| OPENFDA
     WB <-->|REST + cache| OPENFDA
     R3 <-->|API| MISTRAL
