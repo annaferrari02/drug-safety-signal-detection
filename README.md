@@ -268,6 +268,25 @@ For a given drug, the engine builds a 2×2 table for every drug–AE pair:
 
 All four values are computed in a single DuckDB query using CTEs, entirely within the Parquet file. No Python round-trips; all joins stay native in DuckDB.
 
+## Contingency Table Routing Detail
+ 
+```mermaid
+flowchart LR
+    INPUT["where_extra\n(SQL fragment)"] --> DET{"_detect_route()"}
+ 
+    DET -->|"None"| A["Route A · Global\nfaers_sorted + marginals_global\n~2–5 s"]
+    DET -->|"sex= / age_stratum="| B["Route B · OLAP Cube\nmarginals_cubed\n< 1 s"]
+    DET -->|"drug_name= present"| C["Route C · Inverted Index\nlist_intersect() in DuckDB\n5–8 s"]
+    DET -->|"other filters"| D["Route D · Full scan\nfaers_sorted with WHERE\n60–90 s"]
+ 
+    A --> CT[/"2×2 contingency table\nall drug–AE pairs"/]
+    B --> CT
+    C --> CT
+    D --> CT
+```
+ 
+---
+
 ### Signal Detection (`src/signals.py`)
 
 All four algorithms share the same `contingency_to_vigipy()` conversion and run in parallel via `ThreadPoolExecutor`:
