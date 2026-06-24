@@ -34,6 +34,7 @@ import re
 # ---------------------------------------------------------------------------
 from run_signals import run_pipeline
 from match_drug import resolve_drug_name
+from ae_explained import explain_ae, medlineplus_url
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -602,40 +603,52 @@ def compute_confidence_score(
 # ============================================================================
 
 def render_ae_list(
-    ranked_df: pd.DataFrame,
-    weber_risk: str | None,
-    limit: int | None = None,
+    ranked_df,
+    weber_risk,
+    limit=None,
+    drug_name: str = "",
+    mistral_key: str | None = None,
 ):
+    """
+    Render the ranked list of AE signal cards.
+ 
+    Each card shows: rank, AE name, algo pills, confidence bar, FDA icon,
+    Weber icon. Below each card, a st.expander provides:
+        - Lazy AI-generated 2-sentence explanation (Mistral, on-demand)
+        - MedlinePlus search link
+    """
+    import streamlit as st
+    import numpy as np
+ 
     if ranked_df.empty:
         st.info("No signals detected with the current parameters.")
         return
-
+ 
     display_df = ranked_df if limit is None else ranked_df.head(limit)
-
+ 
     weber_emoji, _, _ = WEBER_COLORS.get(
         (weber_risk or "").upper(),
         ("⬜", "", "N/A"),
     )
-
-    # Tooltip texts
+ 
     WEBER_TIP = {
         "LOW":    "🟢 Low bias risk \u2014 stable reporting over time.",
         "MEDIUM": "🟡 Moderate bias risk \u2014 early-phase spike detected. Interpret with caution.",
         "HIGH":   "🔴 High bias risk \u2014 reports clustered post-approval. May reflect notoriety, not pharmacology.",
     }
     weber_tip = WEBER_TIP.get((weber_risk or "").upper(), "Weber check not run.")
-
+ 
     for idx, row in display_df.iterrows():
         ae       = row["ae_name"]
         score    = row["confidence_score"]
         algos    = row.get("algorithms_positive", [])
         val_st   = row.get("validation_status", "")
         is_known = val_st == "KNOWN"
-
+ 
         pills_html = "".join(
             f'<span class="algo-pill">{a}</span>' for a in algos
         )
-
+ 
         bar_color = (
             "#1D4ED8" if score >= 60
             else ("#D97706" if score >= 35 else "#DC2626")
@@ -648,14 +661,14 @@ def render_ae_list(
           </div>
           <div class="conf-label">{score}/100</div>
         </div>"""
-
+ 
         fda_icon = "✅" if is_known else "🔍"
         fda_tip  = (
             "✅ In FDA label \u2014 known adverse event."
             if is_known else
             "🔍 Not in FDA label \u2014 potentially new signal."
         )
-
+ 
         card_html = f"""
         <div class="signal-card">
           <div class="rank-badge">#{idx + 1}</div>
@@ -673,8 +686,37 @@ def render_ae_list(
             <div class="tip">{weber_tip}</div>
           </div>
         </div>"""
-
+ 
         st.markdown(card_html, unsafe_allow_html=True)
+ 
+        # ── More details expander (lazy — no API call until opened) ──────
+        with st.expander(f"More details — {ae}", expanded=False):
+            # AI explanation: try mistral_key param first, then env var fallback.
+            # explain_ae() itself also falls back to MISTRAL_API_KEY env var,
+            # so passing None is safe — it will still work if the env var is set.
+            resolved_mistral = mistral_key or os.environ.get("MISTRAL_API_KEY")
+            if drug_name and resolved_mistral:
+                with st.spinner("Generating explanation…"):
+                    explanation = explain_ae(ae, drug_name, api_key=resolved_mistral)
+                if explanation:
+                    st.markdown(
+                        f'<div style="font-size:13px;line-height:1.6;color:var(--text-2);">'
+                        f'{explanation}</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption("AI explanation unavailable.")
+            else:
+                st.caption("AI explanation unavailable — no Mistral API key provided.")
+
+            # MedlinePlus link — direct page URL, fallback to search for multi-word terms
+            ml_url = medlineplus_url(ae)
+            st.markdown(
+                f'<a href="{ml_url}" target="_blank" '
+                f'style="font-size:12px;color:#3B82F6;text-decoration:none;">'
+                f'🔗 Read more on MedlinePlus</a>',
+                unsafe_allow_html=True,
+            )
 
 
 # ============================================================================
@@ -685,6 +727,7 @@ def build_config_from_ui(
     target_drug, where_extra, min_a, algorithms,
     fdr_threshold, eb05_threshold, ic_threshold,
     openfda_api_key, validate_label, check_weber, weber_approval_override,
+    mistral_key=None,                          # ← aggiungi
 ) -> dict:
     return {
         "target_drug":             target_drug.strip().upper(),
@@ -698,6 +741,7 @@ def build_config_from_ui(
         "validate_label":          validate_label,
         "check_weber":             check_weber,
         "weber_approval_override": weber_approval_override,
+        "mistral_key":             mistral_key,  # ← aggiungi
     }
 
 
@@ -831,7 +875,14 @@ def run_and_display(
     ranked = compute_confidence_score(validated, algo_results, ct=ct)
 
     if not ranked.empty:
-        render_ae_list(ranked, weber_risk=weber_risk, limit=ae_limit)
+        render_ae_list(
+          ranked,
+          weber_risk=weber_risk,
+          limit=ae_limit,
+          drug_name=config.get("target_drug", ""),
+          mistral_key=config.get("mistral_key"),
+      )
+        
     else:
         st.info("No positive signals detected with the current parameters.")
 
@@ -1083,17 +1134,18 @@ if st.button("▶  Run analysis", type="primary"):
     )
 
     config = build_config_from_ui(
-        target_drug=resolved_drug,
-        where_extra=where_extra,
-        min_a=min_a,
-        algorithms=algorithms,
-        fdr_threshold=fdr_threshold,
-        eb05_threshold=eb05_threshold,
-        ic_threshold=ic_threshold,
-        openfda_api_key=openfda_api_key or None,
-        validate_label=validate_label_cb,
-        check_weber=check_weber_cb,
-        weber_approval_override=weber_override_int,
-    )
+    target_drug=resolved_drug,
+    where_extra=where_extra,
+    min_a=min_a,
+    algorithms=algorithms,
+    fdr_threshold=fdr_threshold,
+    eb05_threshold=eb05_threshold,
+    ic_threshold=ic_threshold,
+    openfda_api_key=openfda_api_key or None,
+    validate_label=validate_label_cb,
+    check_weber=check_weber_cb,
+    weber_approval_override=weber_override_int,
+    mistral_key=mistral_key or None,          
+)
 
     run_and_display(config, age_stratum=age_stratum, ae_limit=ae_limit)

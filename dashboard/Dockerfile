@@ -12,6 +12,7 @@ COPY vigipy/ ./vigipy/
 # Copia src/ per le funzioni condivise (es. text_to_sql, build_contingency_table)
 COPY src/ ./src/
 COPY src/match_drug.py .
+COPY src/ae_explained.py . 
 
 
 # Copia run_signals.py nella stessa posizione (root /app) usata dal
