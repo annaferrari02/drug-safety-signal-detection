@@ -340,6 +340,14 @@ The Streamlit dashboard provides a single-page interface where users input a dru
 - Full signal table download (CSV)
 - Weber effect detail expander (quarterly report distribution, trend slope, peak offset)
 
+### AI-powered adverse event explanations
+
+Each signal card includes an expandable **"More details"** section powered by [Mistral AI](https://mistral.ai). When opened, the dashboard sends the adverse event (MedDRA preferred term) and drug name to the Mistral API, which returns a 2-sentence clinical explanation written for healthcare professionals: one sentence describing what the adverse event is, one describing its known or suspected relationship with the drug.
+
+The explanation is generated on demand (lazy loading) — no API call is made until the user opens the expander. If the Mistral API key is not configured, the section displays "AI explanation unavailable" without blocking the rest of the results.
+
+Each card also includes a direct link to [MedlinePlus](https://medlineplus.gov) for the corresponding condition. Single-word MedDRA terms resolve to a direct article page; multi-word terms fall back to the MedlinePlus search index. URL validity is verified at runtime with a HEAD request and cached per session.
+
 ---
 
 ## Installation & Setup
@@ -455,8 +463,8 @@ python run_prepare.py    # builds marginals and inverted index
 | Name | Contact |
 |------|------|
 | Anna Ferrari | @annaferrari02 |
-| Margherita Todesco |  @ |
-| Giulia De Bei | @ |
+| Margherita Todesco |  @margh3rita |
+| Giulia De Bei | @GiDiBi03 |
 
 ---
 
