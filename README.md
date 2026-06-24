@@ -367,6 +367,7 @@ The explanation is generated on demand (lazy loading) — no API call is made un
 
 Each card also includes a direct link to [MedlinePlus](https://medlineplus.gov) for the corresponding condition. Single-word MedDRA terms resolve to a direct article page; multi-word terms fall back to the MedlinePlus search index. URL validity is verified at runtime with a HEAD request and cached per session.
 
+![Dashboard demo](assets/demo.gif)
 ---
 
 ## Installation & Setup
