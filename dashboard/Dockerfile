@@ -24,6 +24,7 @@ COPY signals/run_signals.py .
 
 # Copia lo script Streamlit
 COPY dashboard/appli.py .
+COPY .streamlit/ ./.streamlit/
 
 RUN mkdir -p data
 

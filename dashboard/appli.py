@@ -52,26 +52,26 @@ st.markdown("""
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
     :root {
-        --bg:           #F4F6F9;
-        --surface:      #FFFFFF;
-        --surface-2:    #F0F3F8;
-        --border:       #DDE3ED;
-        --border-light: #EEF1F6;
-        --text:         #111827;
-        --text-2:       #4B5563;
-        --text-3:       #9CA3AF;
-        --accent:       #1D4ED8;
-        --accent-light: #EFF6FF;
-        --accent-mid:   #BFDBFE;
-        --green:        #065F46;
-        --green-bg:     #ECFDF5;
-        --green-border: #A7F3D0;
-        --orange:       #92400E;
-        --orange-bg:    #FFFBEB;
-        --orange-border:#FDE68A;
-        --red:          #7F1D1D;
-        --red-bg:       #FEF2F2;
-        --red-border:   #FECACA;
+        --bg:           #0E1117;
+        --surface:      #1A1F2B;
+        --surface-2:    #20262F;
+        --border:       #2D3340;
+        --border-light: #262C38;
+        --text:         #F4F6F9;
+        --text-2:       #B0B8C4;
+        --text-3:       #6B7280;
+        --accent:       #3B82F6;
+        --accent-light: #1E293B;
+        --accent-mid:   #2563EB;
+        --green:        #6EE7B7;
+        --green-bg:     #064E3B;
+        --green-border: #10B981;
+        --orange:       #FCD34D;
+        --orange-bg:    #78350F;
+        --orange-border:#F59E0B;
+        --red:          #FCA5A5;
+        --red-bg:       #7F1D1D;
+        --red-border:   #EF4444;
         --radius:       8px;
         --radius-lg:    12px;
     }
