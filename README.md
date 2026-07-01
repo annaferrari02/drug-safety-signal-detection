@@ -86,27 +86,40 @@ The system is a Dockerized microservice pipeline with three main layers:
 
 flowchart TD
 
-    FDA(["`**FDA FAERS**\nopenFDA API`"])
-    HF(["`**Hugging Face**\ndrug-safety-faers`"])
-    OPENFDA(["`openFDA\nlabel + drugsatfda`"])
-    MISTRAL(["`Mistral AI\nINN extraction`"])
+    FDA(["`**FDA FAERS**
+    openFDA API`"])
+    HF(["`**Hugging Face**
+    drug-safety-faers`"])
+    OPENFDA(["`openFDA
+    label + drugsatfda`"])
+    MISTRAL(["`Mistral AI
+    INN extraction`"])
 
     subgraph ING["INGESTION"]
         direction LR
-        DL["`run_download.py\nQuarterly ZIPs`"]
-        FL["`run_flatten.py\nijson streaming`"]
-        DD["`Deduplication\nDuckDB`"]
-        PR["`run_prepare.py\nPre-aggregation`"]
+        DL["`run_download.py
+        Quarterly ZIPs`"]
+        FL["`run_flatten.py
+        ijson streaming`"]
+        DD["`Deduplication
+        DuckDB`"]
+        PR["`run_prepare.py
+        Pre-aggregation`"]
         DL --> FL --> DD --> PR
     end
 
     subgraph LAKE["DATA LAKE  ·  data/  ·  shared volume"]
         direction LR
-        P1["`**faers_flat_deduped.parquet**\n741 M rows · 2 GB · 1986–2026`"]
-        P2["`faers_sorted.parquet\nrow-group pruning`"]
-        P3["`marginals_global.parquet\n17,756 rows`"]
-        P4["`marginals_cubed.parquet\nsex × age × PT`"]
-        P5["`drug_inverted_index.parquet\n155,789 drugs`"]
+        P1["`**faers_flat_deduped.parquet**
+        741 M rows · 2 GB · 1986–2026`"]
+        P2["`faers_sorted.parquet
+        row-group pruning`"]
+        P3["`marginals_global.parquet
+        17,756 rows`"]
+        P4["`marginals_cubed.parquet
+        sex × age × PT`"]
+        P5["`drug_inverted_index.parquet
+        155,789 drugs`"]
     end
 
     subgraph PIPE["SIGNAL PIPELINE"]
@@ -114,33 +127,45 @@ flowchart TD
 
         subgraph RES["Drug name resolution  ·  match_drug.py"]
             direction LR
-            R0["`Brand→INN\noffline`"] -->|miss| R1["`Exact\nmatch`"] -->|miss| R2["`rapidfuzz\n≥75/100`"] -->|miss| R3["`Mistral AI\nfallback`"]
+            R0["`Brand→INN
+            offline`"] -->|miss| R1["`Exact\nmatch`"] -->|miss| R2["`rapidfuzz\n≥75/100`"] -->|miss| R3["`Mistral AI\nfallback`"]
         end
 
         subgraph CT["Contingency table  ·  contingency_table.py"]
             direction LR
-            RA["`Route A\nGlobal · 2–5s`"]
-            RB["`Route B\nOLAP · <1s`"]
-            RC["`Route C\nco-med · 5–8s`"]
-            RD["`Route D\nfull scan`"]
+            RA["`Route A
+            Global · 2–5s`"]
+            RB["`Route B
+            OLAP · <1s`"]
+            RC["`Route C
+            co-med · 5–8s`"]
+            RD["`Route D
+            full scan`"]
         end
 
-        TABLE["`**2×2 contingency table**\nall drug–AE pairs`"]
+        TABLE["`**2×2 contingency table**
+        all drug–AE pairs`"]
 
         subgraph ALG["Algorithms  ·  signals.py  ·  ThreadPoolExecutor × 4"]
             direction LR
-            PRR["`**PRR**\nFDR<0.05`"]
-            ROR["`**ROR**\nFDR<0.05`"]
-            BCPNN["`**BCPNN**\nIC025>0`"]
-            MGPS["`**MGPS**\nEB05≥2`"]
+            PRR["`**PRR**
+            FDR<0.05`"]
+            ROR["`**ROR**
+            FDR<0.05`"]
+            BCPNN["`**BCPNN**
+            IC025>0`"]
+            MGPS["`**MGPS**
+            EB05≥2`"]
         end
 
         UNION["`Union of positive signals`"]
 
         subgraph VAL["Validation  ·  parallel I/O"]
             direction LR
-            VL["`validate_label.py\nKNOWN / NEW`"]
-            WB["`weber_check.py\nLOW / MOD / HIGH`"]
+            VL["`validate_label.py
+            KNOWN / NEW`"]
+            WB["`weber_check.py
+            LOW / MOD / HIGH`"]
         end
 
         SCORE["`**Confidence score**\n30% concordance · 40% strength · 30% rate`"]
@@ -151,7 +176,8 @@ flowchart TD
     subgraph DASH["DASHBOARD  ·  Streamlit  ·  :8501"]
         direction LR
         UI["`Drug input · filters · parameters`"]
-        CACHE["`CT cache\nst.session_state`"]
+        CACHE["`CT cache
+        st.session_state`"]
         AE["`AE cards · score · FDA ✅ · Weber ⚠`"]
         UI --> CACHE --> AE
     end
@@ -203,7 +229,8 @@ Route selection is automatic via regex matching on the `where_extra` SQL fragmen
  
 ```mermaid
 flowchart LR
-    INPUT["where_extra\n(SQL fragment)"] --> DET{"_detect_route()"}
+    INPUT["where_extra
+    (SQL fragment)"] --> DET{"_detect_route()"}
  
     DET -->|"None"| A["Route A · Global\nfaers_sorted + marginals_global\n~2–5 s"]
     DET -->|"sex= / age_stratum="| B["Route B · OLAP Cube\nmarginals_cubed\n< 1 s"]
